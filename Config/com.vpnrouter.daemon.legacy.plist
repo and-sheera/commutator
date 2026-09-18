@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.vpnrouter.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/PrivilegedHelperTools/com.vpnrouter/VPNRouterDaemon</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>VPNROUTER_ALLOWED_CLIENT_ID</key><string>com.vpnrouter.app</string>
+        <key>VPNROUTER_TEAM_ID</key><string></string>
+        <key>VPNROUTER_CERT_SHA1</key><string></string>
+        <key>VPNROUTER_ALLOW_UNSIGNED</key><string>0</string>
+        <key>VPNROUTER_OPENVPN</key><string>/Library/PrivilegedHelperTools/com.vpnrouter/VPNTools/openvpn</string>
+        <key>VPNROUTER_AWG_GO</key><string>/Library/PrivilegedHelperTools/com.vpnrouter/VPNTools/amneziawg-go</string>
+        <key>VPNROUTER_AWG_TOOL</key><string>/Library/PrivilegedHelperTools/com.vpnrouter/VPNTools/awg</string>
+        <key>VPNROUTER_XRAY</key><string>/Library/PrivilegedHelperTools/com.vpnrouter/VPNTools/xray</string>
+    </dict>
+    <key>MachServices</key>
+    <dict>
+        <key>com.vpnrouter.daemon</key><true/>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ProcessType</key><string>Interactive</string>
+</dict>
+</plist>

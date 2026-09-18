@@ -1,0 +1,8 @@
+.build/
+Build/
+Vendor/bin/arm64/*
+Vendor/sources/*
+!Vendor/bin/arm64/.gitkeep
+!Vendor/sources/.gitkeep
+.DS_Store
+local/

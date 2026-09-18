@@ -1,0 +1,4 @@
+/* Имя приложения в Finder, Dock, Launchpad, меню и системных запросах.
+   Файл остаётся Commutator.app: латинский путь нужен установщику и скриптам. */
+CFBundleName = "Коммутатор";
+CFBundleDisplayName = "Коммутатор";
