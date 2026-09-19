@@ -1226,6 +1226,22 @@ private struct GeneralPage: View {
                 }
             }
             Section {
+                LabeledContent("Версия", value: Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? VPNRouterVersion.current)
+                HStack {
+                    if let update = model.update {
+                        Text("Доступна версия \(update.release.version)").foregroundStyle(.secondary)
+                    } else if let result = model.updateCheckResult {
+                        Text(result).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if model.checkingUpdate { ProgressView().controlSize(.small) }
+                    Button("Проверить сейчас") { Task { await model.checkForUpdate() } }
+                        .disabled(model.checkingUpdate)
+                }
+            } header: {
+                Text("Обновления")
+            }
+            Section {
                 Button("Удалить Коммутатор…", role: .destructive) { model.uninstall() }
             } footer: {
                 Note("Удалит приложение, системный компонент, профили и настройки и вернёт сеть в состояние до установки.")
@@ -1791,39 +1807,67 @@ private struct Banners: View {
             if let error = model.visibleError {
                 MessageBanner(error, color: .red) { model.dismissError() }
             } else if let message = model.systemComponentMessage {
-                MessageBanner(message, color: .orange, action: model.componentFix.map { fix in
-                    (fix == .install ? "Установить…" : "Открыть настройки", { model.fixSystemComponent() })
-                })
+                MessageBanner(message, color: .orange, actions: model.componentFix.map { fix in
+                    [(fix == .install ? "Установить…" : "Открыть настройки", { model.fixSystemComponent() })]
+                } ?? [])
+            } else if let update = model.update {
+                UpdateBanner(model: model, update: update)
             }
         }
         .padding(insets)
     }
 }
 
+/// Two clicks, each the user's: download, then install, which takes VPN down.
+private struct UpdateBanner: View {
+    @ObservedObject var model: AppModel
+    let update: AppModel.UpdateState
+
+    var body: some View {
+        let version = update.release.version
+        switch update {
+        case .available:
+            MessageBanner("Доступна версия \(version)", color: .blue, symbol: "arrow.down.circle.fill", actions: [
+                ("Что нового", { model.showReleaseNotes() }), ("Скачать", { model.downloadUpdate() }),
+            ])
+        case .downloading:
+            MessageBanner("Скачивается обновление \(version)…", color: .blue, symbol: "arrow.down.circle.fill")
+        case .ready:
+            MessageBanner("Обновление \(version) скачано. VPN выключится на время обновления, Коммутатор перезапустится", color: .blue, symbol: "arrow.down.circle.fill", actions: [
+                ("Что нового", { model.showReleaseNotes() }), ("Обновить и перезапустить…", { model.installUpdate() }),
+            ])
+        case .installing:
+            MessageBanner("Устанавливается обновление \(version)…", color: .blue, symbol: "arrow.down.circle.fill")
+        }
+    }
+}
+
 private struct MessageBanner: View {
     let message: String
     let color: Color
+    var symbol: String?
     /// The fix, where the banner itself can offer one.
-    let action: (title: String, run: () -> Void)?
+    let actions: [(title: String, run: () -> Void)]
     let onDismiss: (() -> Void)?
 
-    init(_ message: String, color: Color, action: (title: String, run: () -> Void)? = nil, onDismiss: (() -> Void)? = nil) {
+    init(_ message: String, color: Color, symbol: String? = nil, actions: [(title: String, run: () -> Void)] = [], onDismiss: (() -> Void)? = nil) {
         self.message = message
         self.color = color
-        self.action = action
+        self.symbol = symbol
+        self.actions = actions
         self.onDismiss = onDismiss
     }
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             // Errors are octagons elsewhere in the app; the triangle is for warnings.
-            Image(systemName: color == .red ? "xmark.octagon.fill" : "exclamationmark.triangle.fill").foregroundStyle(color)
+            Image(systemName: symbol ?? (color == .red ? "xmark.octagon.fill" : "exclamationmark.triangle.fill")).foregroundStyle(color)
             // No fixedSize: the window's minimum is measured at a near-zero width,
             // where a fixed height wraps into a column taller than the window and
             // SwiftUI centres the overflow, pushing the whole window up.
             Text(message)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            if let action { Button(action.title, action: action.run) }
+            ForEach(actions.indices, id: \.self) { index in Button(actions[index].title, action: actions[index].run) }
             if let onDismiss {
                 Button(action: onDismiss) { Image(systemName: "xmark") }
                     .buttonStyle(.borderless)

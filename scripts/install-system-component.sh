@@ -23,6 +23,8 @@ for _ in {1..150}; do
 done
 /usr/bin/install -d -o root -g wheel -m 0755 "$TARGET" "$TARGET_TOOLS"
 /usr/bin/install -o root -g wheel -m 0755 "$CONTENTS/MacOS/VPNRouterDaemon" "$TARGET/VPNRouterDaemon"
+# Run by the daemon for «Удалить Коммутатор…»: from here, where only root writes.
+/usr/bin/install -o root -g wheel -m 0755 "$CONTENTS/Resources/uninstall.sh" "$TARGET/uninstall.sh"
 /usr/bin/install -o root -g wheel -m 0755 "$CONTENTS/Resources/VPNTools/openvpn" "$TARGET_TOOLS/openvpn"
 /usr/bin/install -o root -g wheel -m 0755 "$CONTENTS/Resources/VPNTools/amneziawg-go" "$TARGET_TOOLS/amneziawg-go"
 /usr/bin/install -o root -g wheel -m 0755 "$CONTENTS/Resources/VPNTools/awg" "$TARGET_TOOLS/awg"

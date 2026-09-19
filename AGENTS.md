@@ -20,6 +20,7 @@ make release публикует релиз — агенту не запуска�
 - AdminAuthorization в AppModel должен жить, пока daemon не восстановит его из external form, иначе daemon отклонит.
 - VPNROUTER_DEMO=1 — выдуманные данные для скриншота README (AppModel.fillDemo). В этом режиме XPCClient не обращается к daemon, а настройки не сохраняются. Новый путь к daemon или к UserDefaults закрывай так же.
 - Новый системный файл установщика добавляй в scripts/uninstall.sh.
+- Обновление из приложения ставит daemon без пароля (RouterDaemon.installUpdate): только та же подпись и только новее, скрипты pkg не выполняются, работает scripts/install-update.sh из проверенного бандла. Эти проверки не ослаблять. Удаление без пароля (RouterDaemon.uninstall) проверяется так же и запускает uninstall.sh только из /Library/PrivilegedHelperTools/com.vpnrouter. Новый daemon обязан читать /var/db/com.vpnrouter/state.json старого: новые поля только необязательные.
 - Версии движков меняются синхронно в scripts/build-vpn-tools.sh и THIRD_PARTY_NOTICES.md.
 - Тесты — swift-testing, все в Tests/VPNRouterCoreTests/CoreTests.swift.
 

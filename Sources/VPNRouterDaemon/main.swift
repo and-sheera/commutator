@@ -78,7 +78,7 @@ final class ListenerDelegate: NSObject, NSXPCListenerDelegate {
 
     /// A team ID only counts under Apple's anchor: without it, any self-made
     /// certificate can claim one. A local certificate is pinned by its hash.
-    private static func clientRequirement() -> String? {
+    static func clientRequirement() -> String? {
         let environment = ProcessInfo.processInfo.environment
         let identifier = environment["VPNROUTER_ALLOWED_CLIENT_ID"] ?? "com.vpnrouter.app"
         if let team = environment["VPNROUTER_TEAM_ID"], !team.isEmpty {

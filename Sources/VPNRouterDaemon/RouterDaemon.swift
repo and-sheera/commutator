@@ -181,6 +181,14 @@ actor RouterCoordinator {
                 status.lastError = nil
                 try await updateXray(update)
                 return try response(reported())
+            case .installUpdate:
+                let package: String = try decodePayload(request)
+                try installUpdate(package)
+                return try response(reported())
+            case .uninstall:
+                let app: String = try decodePayload(request)
+                try uninstall(app)
+                return try response(reported())
             }
         } catch let error as RouterErrorInfo {
             status.lastError = error
@@ -1109,6 +1117,103 @@ actor RouterCoordinator {
     private func response<T: Encodable>(_ value: T) throws -> IPCResponse {
         .init(payload: try IPCCodec.encoder.encode(value))
     }
+
+    /// Replaces the app and this daemon from a downloaded pkg, with no password:
+    /// only a client signed as Commutator can ask, and only an app signed the
+    /// same way and newer than this daemon is installed. The pkg's own scripts
+    /// never run, every root step comes from the verified bundle. They run as a
+    /// launchd job of their own: installing boots this daemon out, and a child
+    /// of it would go down with it.
+    private func installUpdate(_ package: String) throws {
+        guard ProcessInfo.processInfo.environment["VPNROUTER_ALLOW_UNSIGNED"] != "1",
+              let requirement = ListenerDelegate.clientRequirement()
+        else { throw RouterErrorInfo(.permissionDenied, "Эту сборку Коммутатора можно обновить только вручную, из pkg") }
+        // A second click while the first install runs would boot it out halfway.
+        if let job = try? runner.run("/bin/launchctl", ["print", "system/" + Self.updateLabel]), job.stdout.contains("state = running") {
+            throw RouterErrorInfo(.internalError, "Обновление уже устанавливается")
+        }
+        // Only a plain file: through a link the user could swap what was checked.
+        guard (try? FileManager.default.attributesOfItem(atPath: package)[.type] as? FileAttributeType) == .typeRegular else {
+            throw RouterErrorInfo(.invalidConfiguration, "Скачанное обновление не найдено")
+        }
+        // Root-only, so nothing is swapped between the check and the install.
+        let work = StoredState.directory.appendingPathComponent("update", isDirectory: true)
+        try? FileManager.default.removeItem(at: work)
+        var started = false
+        defer { if !started { try? FileManager.default.removeItem(at: work) } }
+        try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let copy = work.appendingPathComponent("Commutator.pkg").path
+        try FileManager.default.copyItem(atPath: package, toPath: copy)
+        let expanded = work.appendingPathComponent("expanded").path
+        try runner.checked("/usr/sbin/pkgutil", ["--expand-full", copy, expanded])
+        // Our bundle has no links. One in the payload could point the check at
+        // a folder the user owns and swap the script in it before it runs.
+        let links = try runner.checked("/usr/bin/find", [expanded, "-type", "l"])
+        guard links.stdout.isEmpty else {
+            throw RouterErrorInfo(.permissionDenied, "В обновлении есть символические ссылки, установка отменена")
+        }
+        let app = expanded + "/Payload/Commutator.app"
+        guard try runner.run("/usr/bin/codesign", ["--verify", "--deep", "--strict", "-R", "=" + requirement, app]).status == 0 else {
+            throw RouterErrorInfo(.permissionDenied, "Подпись обновления не совпадает с установленной версией")
+        }
+        // A downgrade would bring back whatever a newer version fixed.
+        guard let version = NSDictionary(contentsOfFile: app + "/Contents/Info.plist")?["CFBundleShortVersionString"] as? String,
+              VPNRouterVersion.isNewer(version, than: VPNRouterVersion.current)
+        else { throw RouterErrorInfo(.invalidConfiguration, "Обновление не новее установленной версии") }
+        // No LaunchOnlyOnce: that is once per boot, and would keep a second
+        // update before a reboot from running. Without KeepAlive it runs once anyway.
+        let job: [String: Any] = [
+            "Label": Self.updateLabel,
+            "ProgramArguments": ["/bin/zsh", app + "/Contents/Resources/install-update.sh", app, work.path],
+            "RunAtLoad": true,
+        ]
+        let plist = work.appendingPathComponent("job.plist")
+        try PropertyListSerialization.data(fromPropertyList: job, format: .xml, options: 0).write(to: plist)
+        // The previous update's job stays loaded, finished, until a reboot.
+        _ = try? runner.run("/bin/launchctl", ["bootout", "system/" + Self.updateLabel])
+        try runner.checked("/bin/launchctl", ["bootstrap", "system", plist.path])
+        started = true
+        record("Установка обновления \(version)")
+    }
+
+    private static let updateLabel = "com.vpnrouter.update"
+
+    /// «Удалить Коммутатор…» without a password, for the same signed client
+    /// that may install updates. The removal itself is uninstall.sh as a job of
+    /// its own, after this daemon is gone: stopping, it logs and saves state,
+    /// and would put back files removed while it still ran.
+    private func uninstall(_ app: String) throws {
+        guard ProcessInfo.processInfo.environment["VPNROUTER_ALLOW_UNSIGNED"] != "1",
+              let requirement = ListenerDelegate.clientRequirement()
+        else { throw RouterErrorInfo(.permissionDenied, "Эту сборку Коммутатора можно удалить только с паролем администратора") }
+        // Root removes this folder, seconds after the check: only the one place
+        // the installer uses, links resolved, so a swapped parent folder cannot
+        // turn it into another app. A copy elsewhere is the user's own file.
+        let installed = "/Applications/Commutator.app"
+        guard URL(fileURLWithPath: app).resolvingSymlinksInPath().path == installed,
+              try runner.run("/usr/bin/codesign", ["--verify", "-R", "=" + requirement, installed]).status == 0
+        else { throw RouterErrorInfo(.permissionDenied, "Без пароля удаляется только Коммутатор из «Программ»") }
+        // Installed next to the daemon, where only root writes: not run from the
+        // bundle in /Applications, which any admin process can change.
+        let script = "/Library/PrivilegedHelperTools/com.vpnrouter/uninstall.sh"
+        guard FileManager.default.fileExists(atPath: script) else {
+            throw RouterErrorInfo(.helperUnavailable, "Системный компонент установлен старой версией")
+        }
+        let job: [String: Any] = [
+            "Label": Self.uninstallLabel,
+            // The pause lets this reply reach the app before the script stops the daemon.
+            "ProgramArguments": ["/bin/zsh", "-c", "sleep 1; exec /bin/zsh \"$0\" \"$1\"", script, installed],
+            "RunAtLoad": true,
+        ]
+        let plist = StoredState.directory.appendingPathComponent("uninstall.plist")
+        try FileManager.default.createDirectory(at: StoredState.directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try PropertyListSerialization.data(fromPropertyList: job, format: .xml, options: 0).write(to: plist)
+        _ = try? runner.run("/bin/launchctl", ["bootout", "system/" + Self.uninstallLabel])
+        try runner.checked("/bin/launchctl", ["bootstrap", "system", plist.path])
+        record("Удаление Коммутатора")
+    }
+
+    private static let uninstallLabel = "com.vpnrouter.uninstall"
 
     private func record(_ message: String) {
         TunnelLog.shared.write("router", message)

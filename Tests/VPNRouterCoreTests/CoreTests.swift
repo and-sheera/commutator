@@ -1002,3 +1002,22 @@ private func dig(_ value: Any?, _ path: String...) -> Any? {
     #expect(result.status == 0)
     #expect(result.stdout.utf8.count == 204_800)
 }
+
+@Test func releaseIsOfferedOnlyWhenNewerAndPackaged() {
+    #expect(VPNRouterVersion.isNewer("v1.0.10", than: "1.0.9"))
+    #expect(!VPNRouterVersion.isNewer("v1.0.6", than: "1.0.6"))
+    #expect(!VPNRouterVersion.isNewer("1.0.5", than: "1.0.6"))
+    func latest(_ tag: String, asset: String = "Commutator.pkg") -> Data {
+        Data("""
+        {"tag_name": "\(tag)", "body": "Что нового", "assets": [
+          {"name": "\(asset)", "browser_download_url": "https://github.com/and-sheera/commutator/releases/download/\(tag)/\(asset)"}]}
+        """.utf8)
+    }
+    let release = AppRelease.parse(latest("v1.0.7"), installed: "1.0.6")
+    #expect(release?.version == "1.0.7")
+    #expect(release?.notes == "Что нового")
+    #expect(release?.packageURL.lastPathComponent == "Commutator.pkg")
+    #expect(AppRelease.parse(latest("v1.0.6"), installed: "1.0.6") == nil)
+    #expect(AppRelease.parse(latest("v1.0.7", asset: "Other.zip"), installed: "1.0.6") == nil)
+    #expect(AppRelease.parse(Data("{}".utf8), installed: "1.0.6") == nil)
+}

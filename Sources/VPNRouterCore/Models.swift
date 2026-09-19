@@ -354,7 +354,42 @@ public struct RouterErrorInfo: Error, LocalizedError, Codable, Equatable, Sendab
 }
 
 public enum VPNRouterVersion {
-    public static let current = "1.0.6"
+    public static let current = "1.0.7"
+
+    /// Numeric per component: "1.0.10" is newer than "1.0.9". A leading "v"
+    /// is the release tag's, not the version's.
+    public static func isNewer(_ candidate: String, than installed: String) -> Bool {
+        func trimmed(_ version: String) -> String { version.hasPrefix("v") ? String(version.dropFirst()) : version }
+        return trimmed(candidate).compare(trimmed(installed), options: .numeric) == .orderedDescending
+    }
+}
+
+/// A release newer than the running copy, as GitHub's `releases/latest` names it.
+public struct AppRelease: Codable, Sendable, Equatable {
+    public var version: String
+    public var notes: String
+    public var packageURL: URL
+
+    public init(version: String, notes: String, packageURL: URL) {
+        self.version = version
+        self.notes = notes
+        self.packageURL = packageURL
+    }
+
+    public static let latestURL = URL(string: "https://api.github.com/repos/and-sheera/commutator/releases/latest")!
+
+    /// Nil when the release is not newer or carries no package: a release
+    /// published without its pkg has nothing to install yet.
+    public static func parse(_ data: Data, installed: String) -> AppRelease? {
+        struct Asset: Decodable { let name: String; let browser_download_url: URL }
+        struct Latest: Decodable { let tag_name: String; let body: String?; let assets: [Asset] }
+        guard let latest = try? JSONDecoder().decode(Latest.self, from: data),
+              VPNRouterVersion.isNewer(latest.tag_name, than: installed),
+              let package = latest.assets.first(where: { $0.name == "Commutator.pkg" })
+        else { return nil }
+        let version = latest.tag_name.hasPrefix("v") ? String(latest.tag_name.dropFirst()) : latest.tag_name
+        return AppRelease(version: version, notes: latest.body ?? "", packageURL: package.browser_download_url)
+    }
 }
 
 public struct Diagnostics: Codable, Sendable {
@@ -398,6 +433,10 @@ public enum IPCOperation: String, Codable, Sendable {
     case getProfile
     /// Payload: the `ExitItem` to run, or to forget.
     case selectExit, deleteExit
+    /// Payload: the path of a downloaded Commutator.pkg.
+    case installUpdate
+    /// Payload: the app bundle's path, removed along with everything else.
+    case uninstall
 }
 
 /// Asks for a stored profile's text, to edit it in the app. The authorization

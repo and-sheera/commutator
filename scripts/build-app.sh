@@ -49,7 +49,8 @@ cp "$ROOT/Config/com.vpnrouter.daemon.plist" "$OUTPUT/Contents/Library/LaunchDae
 cp "$ROOT/Config/com.vpnrouter.daemon.legacy.plist" "$OUTPUT/Contents/Resources/com.vpnrouter.daemon.legacy.plist"
 cp "$ROOT/scripts/install-system-component.sh" "$OUTPUT/Contents/Resources/install-system-component.sh"
 cp "$ROOT/scripts/uninstall.sh" "$OUTPUT/Contents/Resources/uninstall.sh"
-chmod 0755 "$OUTPUT/Contents/Resources/install-system-component.sh" "$OUTPUT/Contents/Resources/uninstall.sh"
+cp "$ROOT/scripts/install-update.sh" "$OUTPUT/Contents/Resources/install-update.sh"
+chmod 0755 "$OUTPUT/Contents/Resources/install-system-component.sh" "$OUTPUT/Contents/Resources/uninstall.sh" "$OUTPUT/Contents/Resources/install-update.sh"
 cp "$ROOT/Config/AppIcon.icns" "$OUTPUT/Contents/Resources/AppIcon.icns"
 # The Russian name macOS shows; the non-localized one has to match the file name.
 cp -R "$ROOT/Config/ru.lproj" "$OUTPUT/Contents/Resources/"

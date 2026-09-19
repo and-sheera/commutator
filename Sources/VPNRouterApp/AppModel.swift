@@ -75,6 +75,17 @@ final class AppModel: ObservableObject {
     @Published private(set) var routeCheck: RouteCheck?
     @Published private(set) var checkingRoute = false
 
+    /// Each step is the user's own click: found, then downloaded, then installed.
+    enum UpdateState: Equatable {
+        case available(AppRelease), downloading(AppRelease), ready(AppRelease), installing(AppRelease)
+        var release: AppRelease {
+            switch self { case .available(let r), .downloading(let r), .ready(let r), .installing(let r): r }
+        }
+    }
+    @Published private(set) var update: UpdateState?
+    @Published private(set) var checkingUpdate = false
+    @Published private(set) var updateCheckResult: String?
+
     /// The daemon keeps reporting `lastError` until its next successful operation,
     /// so dismissal is remembered by message: hiding one does not hide the next.
     var visibleError: String? {
@@ -128,7 +139,8 @@ final class AppModel: ObservableObject {
     deinit { pollTask?.cancel() }
 
     func setRouting(_ enabled: Bool) {
-        guard pendingEnabled == nil, enabled != status.desiredEnabled else { return }
+        // The daemon in place during an install is about to be replaced.
+        guard !installingUpdate, pendingEnabled == nil, enabled != status.desiredEnabled else { return }
         let missing = missingProfiles
         guard !enabled || missing.isEmpty else {
             errorMessage = (missing.count > 1 ? "Нет профилей ни для одного VPN" : "Нет профиля для \(missing[0].genitive)")
@@ -537,23 +549,202 @@ final class AppModel: ObservableObject {
     /// Removes everything the installer put down, profiles and their keys
     /// included. The daemon puts DNS, PF and routes back itself when stopped.
     func uninstall() {
+        // The demo has nothing installed to remove, and its data is made up.
+        guard !XPCClient.isDemo else { return }
         let alert = NSAlert()
         alert.messageText = "Удалить Коммутатор?"
         alert.informativeText = "VPN выключится, сеть вернётся в состояние до установки. Удалятся приложение, системный компонент, профили и настройки."
         alert.addButton(withTitle: "Удалить")
         alert.addButton(withTitle: "Отмена")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        for service in [SMAppService.mainApp, SMAppService.daemon(plistName: "com.vpnrouter.daemon.plist")] where service.status == .enabled {
-            try? service.unregister()
-        }
         Task {
-            do { try await PrivilegedScript.run("uninstall") }
-            catch { errorMessage = "Не удалось удалить: \(error.localizedDescription)"; return }
+            // Off through the daemon first, as for an update: its teardown on
+            // SIGTERM has twenty seconds before launchd kills it, and anything
+            // left then (PF, DNS) would have nobody to put it back.
+            if status.desiredEnabled {
+                guard await turnOffForQuit() else { return }
+            }
+            // The daemon removes everything without a password. An ad-hoc build,
+            // a component too old for it or none at all: the script, with one.
+            do { _ = try await client.request(.uninstall, payload: Bundle.main.bundlePath, as: RouterStatus.self) }
+            catch {
+                do { try await PrivilegedScript.run("uninstall") }
+                catch { errorMessage = "Не удалось удалить: \(error.localizedDescription)"; return }
+            }
+            // After the request: unregistering a daemon stops it, and it had to answer first.
+            for service in [SMAppService.mainApp, SMAppService.daemon(plistName: "com.vpnrouter.daemon.plist")] where service.status == .enabled {
+                try? await service.unregister()
+            }
+            try? FileManager.default.removeItem(at: Self.updateDirectory.deletingLastPathComponent())
             if let domain = Bundle.main.bundleIdentifier { UserDefaults.standard.removePersistentDomain(forName: domain) }
             // Not NSApp.terminate: its quit dialog would try to turn VPN off
             // through a daemon that is already gone.
             exit(0)
         }
+    }
+
+    // MARK: Updates
+
+    /// Kept in Caches, so a download waits for its install across app restarts.
+    private static let updateDirectory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        .appending(path: Bundle.main.bundleIdentifier ?? "com.vpnrouter.app").appending(path: "Update")
+    private var updatePackage: URL { Self.updateDirectory.appending(path: "Commutator.pkg") }
+    private var updateRelease: URL { Self.updateDirectory.appending(path: "release.json") }
+    /// Set by the copy that installs an update: the new copy turns VPN back on.
+    private let resumeAfterUpdateKey = "resume-after-update"
+
+    private func watchUpdates() {
+        if let data = try? Data(contentsOf: updateRelease),
+           let release = try? IPCCodec.decoder.decode(AppRelease.self, from: data),
+           VPNRouterVersion.isNewer(release.version, than: appVersion),
+           FileManager.default.fileExists(atPath: updatePackage.path) {
+            update = .ready(release)
+        } else {
+            // Installed already, or never finished downloading.
+            try? FileManager.default.removeItem(at: Self.updateDirectory)
+        }
+        Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.checkForUpdate()
+                try? await Task.sleep(for: .seconds(6 * 3600))
+            }
+        }
+    }
+
+    func checkForUpdate() async {
+        // The demo neither reaches out nor stores what it was told.
+        guard !checkingUpdate, !XPCClient.isDemo else { return }
+        checkingUpdate = true
+        defer { checkingUpdate = false }
+        // Silent on failure: no network, or kill switch holding GitHub back.
+        guard let (data, response) = try? await URLSession.shared.data(from: AppRelease.latestURL),
+              (response as? HTTPURLResponse)?.statusCode == 200
+        else {
+            updateCheckResult = "Не удалось проверить: GitHub недоступен"
+            return
+        }
+        guard let release = AppRelease.parse(data, installed: appVersion) else {
+            updateCheckResult = "Установлена последняя версия"
+            return
+        }
+        updateCheckResult = nil
+        if let current = update {
+            // A download or install under way, or a pkg for this very release, stays.
+            if case .downloading = current { return }
+            if case .installing = current { return }
+            if current.release.version == release.version { return }
+            try? FileManager.default.removeItem(at: Self.updateDirectory)
+        }
+        update = .available(release)
+        if UserDefaults.standard.string(forKey: "notified-update") != release.version {
+            UserDefaults.standard.set(release.version, forKey: "notified-update")
+            notify("Вышел Коммутатор \(release.version)", "Скачать обновление можно в окне Коммутатора.")
+        }
+    }
+
+    func showReleaseNotes() {
+        guard let release = update?.release else { return }
+        let alert = NSAlert()
+        alert.messageText = "Что нового в версии \(release.version)"
+        alert.informativeText = release.notes.isEmpty ? "Описания нет." : release.notes
+        alert.runModal()
+    }
+
+    /// The update lands there, the only place the daemon installs to: a copy
+    /// elsewhere would stay behind, older than its daemon.
+    private var canInstallUpdate: Bool {
+        guard Bundle.main.bundlePath == "/Applications/Commutator.app" else {
+            errorMessage = "Обновить из приложения можно только копию в «Программах». Скачайте Commutator.pkg по ссылке на странице проекта и установите его"
+            return false
+        }
+        return true
+    }
+
+    private var installingUpdate: Bool {
+        if case .installing = update { return true }
+        return false
+    }
+
+    func downloadUpdate() {
+        guard case .available(let release) = update, canInstallUpdate else { return }
+        update = .downloading(release)
+        Task {
+            do {
+                let (temporary, response) = try await URLSession.shared.download(from: release.packageURL)
+                defer { try? FileManager.default.removeItem(at: temporary) }
+                guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+                try? FileManager.default.removeItem(at: Self.updateDirectory)
+                try FileManager.default.createDirectory(at: Self.updateDirectory, withIntermediateDirectories: true)
+                try FileManager.default.moveItem(at: temporary, to: updatePackage)
+                try IPCCodec.encoder.encode(release).write(to: updateRelease)
+                update = .ready(release)
+            } catch {
+                update = .available(release)
+                errorMessage = "Не удалось скачать обновление: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// VPN goes off through the daemon that runs it, before the update
+    /// replaces that daemon: its own teardown is not cut short by launchd.
+    /// The daemon installs without a password, see `RouterDaemon.installUpdate`.
+    func installUpdate() {
+        guard case .ready(let release) = update, canInstallUpdate else { return }
+        let wasOn = status.desiredEnabled
+        if wasOn {
+            // From the menu bar panel the alert would open behind other windows.
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.messageText = "Выключить VPN и обновить?"
+            alert.informativeText = "На время обновления трафик пойдёт без туннелей, обычно это до минуты. После перезапуска Коммутатор включит VPN снова."
+            alert.addButton(withTitle: "Выключить VPN и обновить")
+            alert.addButton(withTitle: "Отмена")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+        update = .installing(release)
+        Task {
+            if wasOn {
+                guard await turnOffForQuit() else { update = .ready(release); return }
+                UserDefaults.standard.set(true, forKey: resumeAfterUpdateKey)
+            }
+            // The old copy must not sync its settings into the new daemon.
+            pollTask?.cancel()
+            do {
+                _ = try await client.request(.installUpdate, payload: updatePackage.path, as: RouterStatus.self)
+                // The daemon only starts the install; it is done once the new
+                // daemon answers. Three minutes is far past a slow disk.
+                for _ in 0..<90 {
+                    try? await Task.sleep(for: .seconds(2))
+                    // Newer than this copy rather than equal to the tag: a tag and
+                    // a bundle version that differ must not read as a failure.
+                    if let running = try? await client.request(.getDiagnostics, as: Diagnostics.self),
+                       VPNRouterVersion.isNewer(running.daemonVersion, than: appVersion) {
+                        try? FileManager.default.removeItem(at: Self.updateDirectory)
+                        // Not NSApp.terminate: VPN is already off, its quit dialog
+                        // has nothing to ask. The new copy starts once this one is gone.
+                        let relaunch = Process()
+                        relaunch.executableURL = URL(fileURLWithPath: "/bin/sh")
+                        relaunch.arguments = ["-c", "sleep 1; /usr/bin/open /Applications/Commutator.app"]
+                        try? relaunch.run()
+                        exit(0)
+                    }
+                }
+                throw RouterErrorInfo(.internalError, "новая версия не ответила за три минуты")
+            } catch {
+                update = .ready(release)
+                UserDefaults.standard.removeObject(forKey: resumeAfterUpdateKey)
+                startPolling()
+                if wasOn { setRouting(true) }
+                errorMessage = "Не удалось установить обновление: \(error.localizedDescription). Скачайте Commutator.pkg по ссылке на странице проекта и установите вручную."
+            }
+        }
+    }
+
+    private func resumeAfterUpdate() {
+        // A poll already under way when the install cancelled it lands here too.
+        guard !installingUpdate, UserDefaults.standard.bool(forKey: resumeAfterUpdateKey) else { return }
+        UserDefaults.standard.removeObject(forKey: resumeAfterUpdateKey)
+        setRouting(true)
     }
 
     private func markNeedsInstall() {
@@ -564,6 +755,7 @@ final class AppModel: ObservableObject {
     private func bootstrap() async {
         configureLoginItem()
         startPolling()
+        watchUpdates()
         // A component installed by an earlier run already answers, and polling
         // syncs to it; touching it further would only interrupt something that
         // already works. Otherwise install it now — the app does nothing without
@@ -679,6 +871,7 @@ final class AppModel: ObservableObject {
     }
 
     private func sendProfile(_ payload: ProfilePayload) async -> Bool {
+        guard !installingUpdate else { return false }
         do {
             status = try await client.request(.replaceProfile, payload: payload, as: RouterStatus.self)
             errorMessage = nil
@@ -687,6 +880,8 @@ final class AppModel: ObservableObject {
     }
 
     private func sendSettings() async -> Bool {
+        // The old copy must not sync its settings into the new daemon.
+        guard !installingUpdate else { return false }
         do {
             status = try await client.request(.updateRules, payload: settings, as: RouterStatus.self)
             errorMessage = nil
@@ -719,6 +914,7 @@ final class AppModel: ObservableObject {
                         systemComponentMessage = nil
                         componentFix = nil
                         await syncConfiguration()
+                        if syncedToDaemon { resumeAfterUpdate() }
                     } else {
                         notifyTransitions(from: previousStatus, to: latest)
                         let cameUp = latest.protection == .protected && previousStatus?.protection != .protected
