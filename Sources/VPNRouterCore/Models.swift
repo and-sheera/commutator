@@ -502,7 +502,7 @@ public struct RouterErrorInfo: Error, LocalizedError, Codable, Equatable, Sendab
 }
 
 public enum VPNRouterVersion {
-    public static let current = "1.1.0"
+    public static let current = "1.1.1"
 
     /// Numeric per component: "1.0.10" is newer than "1.0.9". A leading "v"
     /// is the release tag's, not the version's.

@@ -1,4 +1,5 @@
-// Composes the app icon: the switchboard artwork on a light macOS tile.
+// Composes the app icon: the switchboard artwork, whose wooden body is itself
+// the rounded tile, fitted to the macOS icon grid with its shadow.
 // Usage: swift scripts/make-icon.swift <out.png> [artwork.png]
 import CoreGraphics
 import Foundation
@@ -8,9 +9,9 @@ import UniformTypeIdentifiers
 let arguments = CommandLine.arguments
 let output = URL(fileURLWithPath: arguments.count > 1 ? arguments[1] : "icon.png")
 let artworkURL = URL(fileURLWithPath: arguments.count > 2 ? arguments[2] : "Config/IconArtwork.png")
-// Side of the square the artwork is drawn into; its opaque part is narrower
-// than the image itself. Tune by eye.
-let artworkSide: CGFloat = 780
+// Side of the square the artwork is drawn into. The body spans 1162 of the
+// 1254 px image, so 889 makes it the 824 pt tile of the macOS grid. Tune by eye.
+let artworkSide: CGFloat = 889
 
 let space = CGColorSpace(name: CGColorSpace.sRGB)!
 func rgb(_ hex: UInt32, _ alpha: CGFloat = 1) -> CGColor {
@@ -26,17 +27,8 @@ let ctx = CGContext(data: nil, width: 1024, height: 1024, bitsPerComponent: 8, b
                     space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
 ctx.interpolationQuality = .high
 
-// macOS icon grid: an 824 pt rounded square inside the 1024 canvas.
-let tile = CGPath(roundedRect: CGRect(x: 100, y: 100, width: 824, height: 824), cornerWidth: 185, cornerHeight: 185, transform: nil)
-ctx.saveGState()
+// Centered on the 1024 canvas: the body sits on the 824 pt grid square.
 ctx.setShadow(offset: CGSize(width: 0, height: -12), blur: 28, color: rgb(0, 0.3))
-ctx.addPath(tile); ctx.setFillColor(rgb(0xF3EEE7)); ctx.fillPath()
-ctx.restoreGState()
-
-ctx.addPath(tile); ctx.clip()
-let background = CGGradient(colorsSpace: space, colors: [rgb(0xFFFFFF), rgb(0xEAE2D6)] as CFArray, locations: nil)!
-ctx.drawLinearGradient(background, start: CGPoint(x: 512, y: 924), end: CGPoint(x: 512, y: 100), options: [])
-ctx.setShadow(offset: CGSize(width: 0, height: -14), blur: 26, color: rgb(0x3A2410, 0.3))
 ctx.draw(artwork, in: CGRect(x: 512 - artworkSide / 2, y: 512 - artworkSide / 2, width: artworkSide, height: artworkSide))
 
 let destination = CGImageDestinationCreateWithURL(output as CFURL, UTType.png.identifier as CFString, 1, nil)!
