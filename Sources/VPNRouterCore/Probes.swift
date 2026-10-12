@@ -50,6 +50,21 @@ public struct ObservedFlow: Equatable, Sendable {
     }
 }
 
+public enum OpenConnections {
+    /// The peers of every socket `netstat -an` lists: `tcp4 0 0
+    /// 192.168.1.5.52341 104.18.32.47.443 ESTABLISHED` gives 104.18.32.47. The
+    /// port follows the last dot for either family.
+    public static func remoteAddresses(_ output: String) -> Set<String> {
+        Set(output.components(separatedBy: .newlines).compactMap { line in
+            let fields = line.split(whereSeparator: \.isWhitespace)
+            guard fields.count >= 5, fields[0].hasPrefix("tcp") || fields[0].hasPrefix("udp"),
+                  let dot = fields[4].lastIndex(of: ".")
+            else { return nil }
+            return IPAddress(String(fields[4][..<dot]))?.description
+        })
+    }
+}
+
 public enum HostResolver {
     /// Every address the system resolver gives, in its preferred order; an
     /// address comes back as itself. Blocks, so call it off any actor the

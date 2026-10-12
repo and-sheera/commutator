@@ -52,6 +52,11 @@ cp "$ROOT/scripts/uninstall.sh" "$OUTPUT/Contents/Resources/uninstall.sh"
 cp "$ROOT/scripts/install-update.sh" "$OUTPUT/Contents/Resources/install-update.sh"
 chmod 0755 "$OUTPUT/Contents/Resources/install-system-component.sh" "$OUTPUT/Contents/Resources/uninstall.sh" "$OUTPUT/Contents/Resources/install-update.sh"
 cp "$ROOT/Config/AppIcon.icns" "$OUTPUT/Contents/Resources/AppIcon.icns"
+# The «Коммутатор» symbols for the menu bar, the menu header and «Обзор». actool
+# comes with Xcode: Command Line Tools alone cannot build an asset catalog.
+xcrun actool "$ROOT/Config/Symbols.xcassets" --compile "$OUTPUT/Contents/Resources" \
+    --platform macosx --minimum-deployment-target 14.0 \
+    --output-partial-info-plist "$ROOT/.build/symbols-partial.plist" >/dev/null
 # The Russian name macOS shows; the non-localized one has to match the file name.
 cp -R "$ROOT/Config/ru.lproj" "$OUTPUT/Contents/Resources/"
 cp "$BIN_DIR/VPNRouterApp" "$BIN_DIR/VPNRouterDaemon" "$OUTPUT/Contents/MacOS/"

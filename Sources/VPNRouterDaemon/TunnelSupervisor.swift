@@ -3,11 +3,13 @@ import Foundation
 import Network
 import VPNRouterCore
 
+/// Runs any number of tunnels side by side, each under an id the coordinator
+/// picks. Every callback names the tunnel it is about.
 final class TunnelSupervisor: @unchecked Sendable {
     struct Callbacks: Sendable {
-        let status: @Sendable (VPNKind, TunnelStatus) -> Void
-        let pushedOptions: @Sendable ([String], [String], [String]) -> Void
-        let failed: @Sendable (VPNKind, RouterErrorInfo) -> Void
+        let status: @Sendable (String, TunnelStatus) -> Void
+        let pushedOptions: @Sendable (String, PushedOptions) -> Void
+        let failed: @Sendable (String, RouterErrorInfo) -> Void
         let note: @Sendable (String) -> Void
     }
 
@@ -16,46 +18,65 @@ final class TunnelSupervisor: @unchecked Sendable {
         var password: String?
     }
 
+    /// One engine and what watching it needs. Its fields are written from the
+    /// pipe's queue, the management connection's queue and whichever thread
+    /// calls stop(), hence the lock.
+    private final class Tunnel: @unchecked Sendable {
+        let id: String
+        /// For messages: the names of the routes it carries.
+        let title: String
+        /// Tells its files, its log lines and an Xray TUN address apart.
+        let slot: Int
+        let lock = NSLock()
+        private var lockedProcess: Process?
+        private var lockedManagement: NWConnection?
+        private var lockedInterface: String?
+        private var lockedConnected = false
+        private var lockedDeadline: Task<Void, Never>?
+        private var lockedHealth: Task<Void, Never>?
+        var credentials = Credentials()
+        /// Only touched on the management connection's own queue.
+        var managementBuffer = ""
+
+        init(id: String, title: String, slot: Int) {
+            self.id = id
+            self.title = title
+            self.slot = slot
+        }
+
+        var process: Process? {
+            get { lock.withLock { lockedProcess } }
+            set { lock.withLock { lockedProcess = newValue } }
+        }
+        var management: NWConnection? {
+            get { lock.withLock { lockedManagement } }
+            set { lock.withLock { lockedManagement = newValue } }
+        }
+        var interface: String? {
+            get { lock.withLock { lockedInterface } }
+            set { lock.withLock { lockedInterface = newValue } }
+        }
+        var connected: Bool {
+            get { lock.withLock { lockedConnected } }
+            set { lock.withLock { lockedConnected = newValue } }
+        }
+        var deadline: Task<Void, Never>? {
+            get { lock.withLock { lockedDeadline } }
+            set { lock.withLock { lockedDeadline = newValue } }
+        }
+        var health: Task<Void, Never>? {
+            get { lock.withLock { lockedHealth } }
+            set { lock.withLock { lockedHealth = newValue } }
+        }
+    }
+
     private let runner: CommandRunner
     private let callbacks: Callbacks
     private let lock = NSLock()
-    private var processes: [VPNKind: Process] = [:]
-    private var managementBuffer = ""
-    private var healthTask: Task<Void, Never>?
-    private var lockedManagement: NWConnection?
-    private var lockedInterface: String?
-    private var lockedOpenVPNConnected = false
-    private var lockedCredentials = Credentials()
-    private var lockedDeadline: Task<Void, Never>?
-
-    // Armed from the actor, re-armed from the pipe's queue when openvpn announces
-    // a soft restart, cancelled from whichever thread calls stop().
-    private var openVPNDeadline: Task<Void, Never>? {
-        get { lock.withLock { lockedDeadline } }
-        set { lock.withLock { lockedDeadline = newValue } }
-    }
-
-    private var credentials: Credentials {
-        get { lock.withLock { lockedCredentials } }
-        set { lock.withLock { lockedCredentials = newValue } }
-    }
-
-    // Both are written from the pipe's readability queue and from the management
-    // connection's queue, and read from whichever thread calls stop().
-    private var management: NWConnection? {
-        get { lock.withLock { lockedManagement } }
-        set { lock.withLock { lockedManagement = newValue } }
-    }
-
-    private var openVPNInterface: String? {
-        get { lock.withLock { lockedInterface } }
-        set { lock.withLock { lockedInterface = newValue } }
-    }
-
-    private var openVPNConnected: Bool {
-        get { lock.withLock { lockedOpenVPNConnected } }
-        set { lock.withLock { lockedOpenVPNConnected = newValue } }
-    }
+    private var tunnels: [String: Tunnel] = [:]
+    /// TUN names handed to Xray but not yet showing in ifconfig: two starting
+    /// at once would otherwise both pick the first free one.
+    private var reservedUtuns: Set<String> = []
 
     private let runtimeDirectory = URL(fileURLWithPath: "/var/run/com.vpnrouter", isDirectory: true)
 
@@ -64,13 +85,28 @@ final class TunnelSupervisor: @unchecked Sendable {
         self.callbacks = callbacks
     }
 
-    func startOpenVPN(configuration: String, credentials: Credentials) throws {
-        self.credentials = credentials
+    /// A fresh tunnel under `id`, replacing whatever ran there.
+    private func begin(_ id: String, title: String) -> Tunnel {
+        stop(id)
+        return lock.withLock {
+            let used = Set(tunnels.values.map(\.slot))
+            let tunnel = Tunnel(id: id, title: title, slot: (0...).first { !used.contains($0) }!)
+            tunnels[id] = tunnel
+            return tunnel
+        }
+    }
+
+    private func isCurrent(_ tunnel: Tunnel, _ process: Process) -> Bool {
+        lock.withLock { tunnels[tunnel.id] === tunnel } && tunnel.process === process
+    }
+
+    func startOpenVPN(id: String, title: String, configuration: String, credentials: Credentials) throws {
         try prepareRuntimeDirectory()
-        stop(.openVPN)
-        let socket = runtimeDirectory.appendingPathComponent("openvpn.sock").path
+        let tunnel = begin(id, title: title)
+        tunnel.credentials = credentials
+        let socket = runtimeDirectory.appendingPathComponent("openvpn-\(tunnel.slot).sock").path
         try? FileManager.default.removeItem(atPath: socket)
-        let configURL = runtimeDirectory.appendingPathComponent("openvpn.conf")
+        let configURL = runtimeDirectory.appendingPathComponent("openvpn-\(tunnel.slot).conf")
         let managed = configuration + """
         management \(socket) unix
         management-hold
@@ -79,18 +115,19 @@ final class TunnelSupervisor: @unchecked Sendable {
         verb 3
         """
         try writeSecret(managed, to: configURL)
-        callbacks.status(.openVPN, .init(phase: .connecting))
+        callbacks.status(id, .init(phase: .connecting))
+        let source = "openvpn:\(tunnel.slot)"
         let process = try launch(
-            kind: .openVPN,
+            tunnel, engine: "openvpn",
             executable: toolPath(environment: "VPNROUTER_OPENVPN", name: "openvpn"),
             arguments: ["--config", configURL.path],
             environment: [:]
-        ) { [weak self] line in
-            TunnelLog.shared.write("openvpn", line)
-            self?.parseOpenVPNLine(line)
+        ) { [weak self, weak tunnel] line in
+            TunnelLog.shared.write(source, line)
+            if let tunnel { self?.parseOpenVPNLine(line, tunnel) }
         }
-        connectManagement(path: socket, attempt: 0, for: process)
-        startOpenVPNDeadline()
+        connectManagement(tunnel, path: socket, attempt: 0, for: process)
+        startOpenVPNDeadline(tunnel)
     }
 
     // Nothing else bounds the connecting phase: a handshake that never completes
@@ -100,30 +137,31 @@ final class TunnelSupervisor: @unchecked Sendable {
     // Re-armed on every soft restart too. openvpn answers a wake with one, and a
     // reconnect that never lands had nothing watching it: the status sat on
     // «Переподключение» for as long as the network stayed bad.
-    private func startOpenVPNDeadline(_ seconds: Int = 45, reconnect: Bool = false) {
-        openVPNConnected = false
-        openVPNDeadline?.cancel()
-        openVPNDeadline = Task.detached { [weak self] in
+    private func startOpenVPNDeadline(_ tunnel: Tunnel, _ seconds: Int = 45, reconnect: Bool = false) {
+        tunnel.connected = false
+        tunnel.deadline?.cancel()
+        tunnel.deadline = Task.detached { [weak self, weak tunnel] in
             try? await Task.sleep(for: .seconds(seconds))
-            guard !Task.isCancelled, let self, !self.openVPNConnected else { return }
-            self.callbacks.failed(.openVPN, .init(
+            guard !Task.isCancelled, let self, let tunnel, !tunnel.connected else { return }
+            self.callbacks.failed(tunnel.id, .init(
                 .tunnelFailure,
-                "Рабочий VPN не \(reconnect ? "переподключился" : "подключился") за \(seconds) секунд",
+                "«\(tunnel.title)»: VPN не \(reconnect ? "переподключился" : "подключился") за \(seconds) секунд",
                 recoverable: true
             ))
         }
     }
 
-    func startAmneziaWG(profile: AmneziaWGProfile) async throws -> String {
+    func startAmneziaWG(id: String, title: String, profile: AmneziaWGProfile) async throws -> String {
         try prepareRuntimeDirectory()
-        stop(.amneziaWG)
-        let nameFile = runtimeDirectory.appendingPathComponent("awg-interface")
-        let configURL = runtimeDirectory.appendingPathComponent("awg.conf")
+        let tunnel = begin(id, title: title)
+        let nameFile = runtimeDirectory.appendingPathComponent("awg-\(tunnel.slot)-interface")
+        let configURL = runtimeDirectory.appendingPathComponent("awg-\(tunnel.slot).conf")
         try? FileManager.default.removeItem(at: nameFile)
         try writeSecret(profile.setConf, to: configURL)
-        callbacks.status(.amneziaWG, .init(phase: .connecting))
+        callbacks.status(id, .init(phase: .connecting))
+        let source = "amneziawg:\(tunnel.slot)"
         let process = try launch(
-            kind: .amneziaWG,
+            tunnel, engine: "amneziawg-go",
             executable: toolPath(environment: "VPNROUTER_AWG_GO", name: "amneziawg-go"),
             arguments: ["-f", "utun"],
             // At its default level the engine says nothing at all, and its lines are
@@ -133,14 +171,14 @@ final class TunnelSupervisor: @unchecked Sendable {
         ) { line in
             // Verbose repeats this per peer every twenty-five seconds and says nothing.
             guard !line.contains("keepalive") else { return }
-            TunnelLog.shared.write("amneziawg", line)
+            TunnelLog.shared.write(source, line)
         }
 
         var interface: String?
         for _ in 0..<100 {
             // Stopped while we waited: the name file that shows up next belongs to
             // whatever instance replaced this one, and configuring it is not ours.
-            guard isCurrent(process, .amneziaWG) else { throw CancellationError() }
+            guard isCurrent(tunnel, process) else { throw CancellationError() }
             if let value = try? String(contentsOf: nameFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
                value.range(of: "^utun[0-9]+$", options: .regularExpression) != nil {
                 interface = value
@@ -149,8 +187,8 @@ final class TunnelSupervisor: @unchecked Sendable {
             try await Task.sleep(for: .milliseconds(100))
         }
         guard let interface else {
-            stop(.amneziaWG)
-            throw RouterErrorInfo(.tunnelFailure, "Личный VPN не создал сетевой интерфейс", recoverable: true)
+            stop(id)
+            throw RouterErrorInfo(.tunnelFailure, "«\(title)»: VPN не создал сетевой интерфейс", recoverable: true)
         }
         try runner.checked(toolPath(environment: "VPNROUTER_AWG_TOOL", name: "awg"), ["setconf", interface, configURL.path])
         if let mtu = profile.mtu { try runner.checked("/sbin/ifconfig", [interface, "mtu", String(mtu)]) }
@@ -164,7 +202,7 @@ final class TunnelSupervisor: @unchecked Sendable {
                 try runner.checked("/sbin/ifconfig", [interface, "inet", address, ip, "alias"])
             }
         }
-        startHealthMonitoring(interface: interface, endpoint: profile.endpointHost)
+        startHealthMonitoring(tunnel, interface: interface, endpoint: profile.endpointHost)
         return interface
     }
 
@@ -172,52 +210,58 @@ final class TunnelSupervisor: @unchecked Sendable {
     /// whose password only this process knows: the check then takes the very
     /// outbound the traffic does, and its test name resolves on the server's
     /// side, where neither the kill switch nor a missing route gets in the way.
-    func startXray(server: XrayServer, physicalInterface: String) async throws -> String {
+    func startXray(id: String, title: String, server: XrayServer, physicalInterface: String) async throws -> String {
         try prepareRuntimeDirectory()
-        stop(.amneziaWG)
-        let interface = freeUtun()
+        let tunnel = begin(id, title: title)
+        let interface = reserveUtun()
+        defer { lock.withLock { _ = reservedUtuns.remove(interface) } }
         let probe = XrayProbe(port: Int.random(in: 20_000..<60_000), user: UUID().uuidString, password: UUID().uuidString)
-        let configURL = runtimeDirectory.appendingPathComponent("xray.json")
-        let probeURL = runtimeDirectory.appendingPathComponent("xray-probe.curl")
+        let configURL = runtimeDirectory.appendingPathComponent("xray-\(tunnel.slot).json")
+        let probeURL = runtimeDirectory.appendingPathComponent("xray-\(tunnel.slot)-probe.curl")
         try writeSecret(
-            try XrayProfileParser.configuration(for: server, interface: interface, physicalInterface: physicalInterface, probe: probe),
+            try XrayProfileParser.configuration(for: server, interface: interface, physicalInterface: physicalInterface, probe: probe, slot: tunnel.slot),
             to: configURL
         )
         // In a file, not in curl's arguments: those show up in ps for every local user.
         try writeSecret("proxy = \"socks5h://\(probe.user):\(probe.password)@127.0.0.1:\(probe.port)\"\n", to: probeURL)
-        callbacks.status(.amneziaWG, .init(phase: .connecting))
+        callbacks.status(id, .init(phase: .connecting))
+        let source = "xray:\(tunnel.slot)"
         let process = try launch(
-            kind: .amneziaWG,
+            tunnel, engine: "xray",
             executable: toolPath(environment: "VPNROUTER_XRAY", name: "xray"),
             arguments: ["run", "-c", configURL.path],
             environment: [:]
-        ) { line in TunnelLog.shared.write("xray", line) }
+        ) { line in TunnelLog.shared.write(source, line) }
         for _ in 0..<100 {
-            guard isCurrent(process, .amneziaWG) else { throw CancellationError() }
+            guard isCurrent(tunnel, process) else { throw CancellationError() }
             if (try? runner.run("/sbin/ifconfig", [interface]))?.status == 0 {
-                startXrayHealth(interface: interface, probeConfig: probeURL.path)
+                startXrayHealth(tunnel, interface: interface, probeConfig: probeURL.path, serverName: server.name)
                 return interface
             }
             try await Task.sleep(for: .milliseconds(100))
         }
-        stop(.amneziaWG)
-        throw RouterErrorInfo(.tunnelFailure, "Личный VPN не создал сетевой интерфейс \(interface)", recoverable: true)
+        stop(id)
+        throw RouterErrorInfo(.tunnelFailure, "«\(title)»: VPN не создал сетевой интерфейс \(interface)", recoverable: true)
     }
 
     /// Picked here rather than by Xray: the routes need the name up front.
-    private func freeUtun() -> String {
-        let taken = Set(((try? runner.run("/sbin/ifconfig", ["-l"]))?.stdout ?? "").split(whereSeparator: \.isWhitespace).map(String.init))
-        return (100..<200).lazy.map { "utun\($0)" }.first { !taken.contains($0) } ?? "utun199"
+    private func reserveUtun() -> String {
+        let listed = Set(((try? runner.run("/sbin/ifconfig", ["-l"]))?.stdout ?? "").split(whereSeparator: \.isWhitespace).map(String.init))
+        return lock.withLock {
+            let name = (100..<200).lazy.map { "utun\($0)" }.first { !listed.contains($0) && !reservedUtuns.contains($0) } ?? "utun199"
+            reservedUtuns.insert(name)
+            return name
+        }
     }
 
-    private func startXrayHealth(interface: String, probeConfig: String) {
+    private func startXrayHealth(_ tunnel: Tunnel, interface: String, probeConfig: String, serverName: String) {
         let started = Date()
-        healthTask?.cancel()
-        healthTask = Task.detached { [weak self] in
+        tunnel.health?.cancel()
+        tunnel.health = Task.detached { [weak self, weak tunnel] in
             var seen = false
             var misses = 0
             while !Task.isCancelled {
-                guard let self else { return }
+                guard let self, let tunnel else { return }
                 let code = (try? self.runner.run("/usr/bin/curl", [
                     "-K", probeConfig, "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "5",
                     "http://cp.cloudflare.com/generate_204",
@@ -225,18 +269,18 @@ final class TunnelSupervisor: @unchecked Sendable {
                 if code == "204" {
                     seen = true
                     misses = 0
-                    self.callbacks.status(.amneziaWG, .init(phase: .connected, interfaceName: interface))
+                    self.callbacks.status(tunnel.id, .init(phase: .connected, interfaceName: interface))
                 } else if seen {
                     // One lost probe is noise: the routes move only after two, and
                     // the tunnel is given up after four, about forty seconds.
                     misses += 1
                     if misses >= 4 {
-                        self.callbacks.failed(.amneziaWG, .init(.tunnelFailure, "Сервер личного VPN перестал отвечать", recoverable: true))
+                        self.callbacks.failed(tunnel.id, .init(.tunnelFailure, "Сервер «\(serverName)» перестал отвечать", recoverable: true))
                         return
                     }
-                    if misses >= 2 { self.callbacks.status(.amneziaWG, .init(phase: .reconnecting, interfaceName: interface)) }
+                    if misses >= 2 { self.callbacks.status(tunnel.id, .init(phase: .reconnecting, interfaceName: interface)) }
                 } else if Date().timeIntervalSince(started) > 35 {
-                    self.callbacks.failed(.amneziaWG, .init(.tunnelFailure, "Личный VPN не достучался до сервера за 35 секунд", recoverable: true))
+                    self.callbacks.failed(tunnel.id, .init(.tunnelFailure, "Сервер «\(serverName)» не ответил за 35 секунд", recoverable: true))
                     return
                 }
                 try? await Task.sleep(for: .seconds(seen ? 10 : 1))
@@ -245,22 +289,17 @@ final class TunnelSupervisor: @unchecked Sendable {
     }
 
     func stopAll() {
-        stop(.openVPN)
-        stop(.amneziaWG)
+        for id in lock.withLock({ Array(tunnels.keys) }) { stop(id) }
         try? FileManager.default.removeItem(at: runtimeDirectory)
     }
 
-    func stop(_ kind: VPNKind) {
-        TunnelLog.shared.write("supervisor", "остановка \(kind.title)")
-        lock.lock()
-        let process = processes.removeValue(forKey: kind)
-        lock.unlock()
-        if kind == .openVPN {
-            openVPNDeadline?.cancel(); openVPNDeadline = nil
-            management?.cancel(); management = nil; openVPNInterface = nil
-        }
-        if kind == .amneziaWG { healthTask?.cancel(); healthTask = nil }
-        if let process, process.isRunning {
+    func stop(_ id: String) {
+        guard let tunnel = lock.withLock({ tunnels.removeValue(forKey: id) }) else { return }
+        TunnelLog.shared.write("supervisor", "остановка «\(tunnel.title)»")
+        tunnel.deadline?.cancel(); tunnel.deadline = nil
+        tunnel.management?.cancel(); tunnel.management = nil
+        tunnel.health?.cancel(); tunnel.health = nil
+        if let process = tunnel.process, process.isRunning {
             process.terminate()
             for _ in 0..<20 where process.isRunning { usleep(50_000) }
             if process.isRunning { kill(process.processIdentifier, SIGKILL) }
@@ -268,7 +307,8 @@ final class TunnelSupervisor: @unchecked Sendable {
     }
 
     private func launch(
-        kind: VPNKind,
+        _ tunnel: Tunnel,
+        engine: String,
         executable: String,
         arguments: [String],
         environment: [String: String],
@@ -287,99 +327,83 @@ final class TunnelSupervisor: @unchecked Sendable {
         let reader = LineAccumulator(onLine: onLine)
         pipe.fileHandleForReading.readabilityHandler = { handle in reader.append(handle.availableData) }
         TunnelLog.shared.write("supervisor", "запуск \(executable) \(arguments.joined(separator: " "))")
-        process.terminationHandler = { [weak self] process in
+        process.terminationHandler = { [weak self, weak tunnel] process in
             pipe.fileHandleForReading.readabilityHandler = nil
-            TunnelLog.shared.write("supervisor", "\(kind.title) завершился с кодом \(process.terminationStatus)")
-            guard let self else { return }
-            self.lock.lock()
-            let tracked = self.processes[kind] === process
-            if tracked { self.processes.removeValue(forKey: kind) }
-            self.lock.unlock()
-            if tracked {
-                self.callbacks.failed(kind, .init(.tunnelFailure, "\(kind.title) завершился с кодом \(process.terminationStatus)", recoverable: true))
+            TunnelLog.shared.write("supervisor", "\(engine) завершился с кодом \(process.terminationStatus)")
+            guard let self, let tunnel else { return }
+            // Only the one still wanted: a stopped or replaced engine exits quietly.
+            if self.lock.withLock({ self.tunnels[tunnel.id] === tunnel }), tunnel.process === process {
+                self.callbacks.failed(tunnel.id, .init(.tunnelFailure, "\(engine) завершился с кодом \(process.terminationStatus)", recoverable: true))
             }
             _ = reader
         }
-        setProcess(process, for: kind)
-        do { try process.run() }
-        catch {
-            lock.lock()
-            if processes[kind] === process { processes.removeValue(forKey: kind) }
-            lock.unlock()
-            throw error
-        }
+        tunnel.process = process
+        try process.run()
         return process
-    }
-
-    private func setProcess(_ process: Process, for kind: VPNKind) {
-        lock.lock(); processes[kind] = process; lock.unlock()
     }
 
     /// Bound to one openvpn: a chain still retrying for an instance that was
     /// stopped would otherwise report its failure against the next, healthy one.
-    private func connectManagement(path: String, attempt: Int, for process: Process) {
-        guard isCurrent(process, .openVPN) else { return }
+    private func connectManagement(_ tunnel: Tunnel, path: String, attempt: Int, for process: Process) {
+        guard isCurrent(tunnel, process) else { return }
         guard attempt < 50 else {
-            callbacks.failed(.openVPN, .init(.tunnelFailure, "Рабочий VPN не запустился: его процесс не ответил", recoverable: true))
+            callbacks.failed(tunnel.id, .init(.tunnelFailure, "«\(tunnel.title)»: OpenVPN не запустился — его процесс не ответил", recoverable: true))
             return
         }
         guard FileManager.default.fileExists(atPath: path) else {
-            retryManagement(path: path, attempt: attempt, for: process)
+            retryManagement(tunnel, path: path, attempt: attempt, for: process)
             return
         }
         let connection = NWConnection(to: .unix(path: path), using: .tcp)
-        connection.stateUpdateHandler = { [weak self, weak connection] state in
-            guard let self, let connection else { return }
-            TunnelLog.shared.write("mgmt", "состояние соединения: \(state)")
+        connection.stateUpdateHandler = { [weak self, weak connection, weak tunnel] state in
+            guard let self, let connection, let tunnel else { return }
+            TunnelLog.shared.write("mgmt:\(tunnel.slot)", "состояние соединения: \(state)")
             switch state {
             case .ready:
                 // A half line left by the previous connection is not the start of this one's.
-                self.managementBuffer = ""
+                tunnel.managementBuffer = ""
                 self.send("state on\nlog on all\nhold release\n", to: connection)
-                self.receiveManagement(connection)
+                self.receiveManagement(tunnel, connection)
             // A socket that exists but is not accepting yet reports .waiting, not
             // .failed, and NWConnection then retries on its own schedule forever.
             // Without releasing the hold openvpn stays silent, so this is exactly
             // the hang that has to time out into our own bounded retry.
             case .failed, .waiting:
                 connection.cancel()
-                self.retryManagement(path: path, attempt: attempt, for: process)
+                self.retryManagement(tunnel, path: path, attempt: attempt, for: process)
             default: break
             }
         }
-        management = connection
-        connection.start(queue: DispatchQueue(label: "com.vpnrouter.openvpn.management"))
+        tunnel.management = connection
+        connection.start(queue: DispatchQueue(label: "com.vpnrouter.openvpn.management.\(tunnel.slot)"))
     }
 
-    private func retryManagement(path: String, attempt: Int, for process: Process) {
-        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            self?.connectManagement(path: path, attempt: attempt + 1, for: process)
+    private func retryManagement(_ tunnel: Tunnel, path: String, attempt: Int, for process: Process) {
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) { [weak self, weak tunnel] in
+            guard let tunnel else { return }
+            self?.connectManagement(tunnel, path: path, attempt: attempt + 1, for: process)
         }
     }
 
-    private func isCurrent(_ process: Process, _ kind: VPNKind) -> Bool {
-        lock.withLock { processes[kind] === process }
-    }
-
-    private func receiveManagement(_ connection: NWConnection) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self, weak connection] data, _, complete, error in
-            guard let self, let connection else { return }
+    private func receiveManagement(_ tunnel: Tunnel, _ connection: NWConnection) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self, weak connection, weak tunnel] data, _, complete, error in
+            guard let self, let connection, let tunnel else { return }
             if let data {
-                managementBuffer += String(decoding: data, as: UTF8.self)
-                for line in LineSplitter.take(from: &managementBuffer) {
-                    parseManagementLine(line, connection: connection)
+                tunnel.managementBuffer += String(decoding: data, as: UTF8.self)
+                for line in LineSplitter.take(from: &tunnel.managementBuffer) {
+                    parseManagementLine(line, tunnel, connection: connection)
                 }
             }
-            if !complete && error == nil { receiveManagement(connection) }
+            if !complete && error == nil { receiveManagement(tunnel, connection) }
         }
     }
 
-    private func parseManagementLine(_ line: String, connection: NWConnection) {
+    private func parseManagementLine(_ line: String, _ tunnel: Tunnel, connection: NWConnection) {
         // ">LOG:" repeats what the process already printed on its pipe.
-        if !line.hasPrefix(">LOG:") { TunnelLog.shared.write("mgmt", line) }
-        parseOpenVPNLine(line)
+        if !line.hasPrefix(">LOG:") { TunnelLog.shared.write("mgmt:\(tunnel.slot)", line) }
+        parseOpenVPNLine(line, tunnel)
         if line.hasPrefix(">PASSWORD:Need ") {
-            answerPasswordRequest(line, connection: connection)
+            answerPasswordRequest(line, tunnel, connection: connection)
         } else if line.hasPrefix(">HOLD:") {
             // management-hold holds again after every soft restart (ping-restart,
             // a network change), not only at start: unreleased, openvpn waits forever.
@@ -393,29 +417,29 @@ final class TunnelSupervisor: @unchecked Sendable {
             }
         } else if line.hasPrefix(">PASSWORD:Verification Failed") || line.contains("AUTH_FAILED") {
             let realm = Self.realm(in: line) ?? "Auth"
-            callbacks.failed(.openVPN, .init(
+            callbacks.failed(tunnel.id, .init(
                 .authenticationRequired,
-                realm == "Auth" ? "OpenVPN отклонил логин или пароль" : "OpenVPN отклонил пароль приватного ключа"
+                "«\(tunnel.title)»: " + (realm == "Auth" ? "OpenVPN отклонил логин или пароль" : "OpenVPN отклонил пароль приватного ключа")
             ))
         }
     }
 
-    private func answerPasswordRequest(_ line: String, connection: NWConnection) {
+    private func answerPasswordRequest(_ line: String, _ tunnel: Tunnel, connection: NWConnection) {
         guard let realm = Self.realm(in: line) else { return }
-        let credentials = credentials
+        let credentials = tunnel.credentials
         // One password answers both "Auth" and "Private Key": a profile without
         // auth-user-pass has no other password at all, and official clients ask
         // for this one simply as «Пароль».
         guard let secret = credentials.password, !secret.isEmpty else {
-            callbacks.failed(.openVPN, .init(.authenticationRequired, realm == "Auth"
-                ? "Рабочий VPN требует логин и пароль: укажите их в «Профилях»"
-                : "Приватный ключ профиля зашифрован: впишите в поле «Пароль» тот, что спрашивает официальный клиент OpenVPN, и включите маршрутизацию снова"))
+            callbacks.failed(tunnel.id, .init(.authenticationRequired, realm == "Auth"
+                ? "«\(tunnel.title)»: OpenVPN требует логин и пароль — укажите их на странице «VPN»"
+                : "«\(tunnel.title)»: приватный ключ профиля зашифрован — впишите на странице «VPN» в поле «Пароль» тот, что спрашивает официальный клиент OpenVPN, и включите маршрутизацию снова"))
             return
         }
         var commands = ""
         if line.contains("username/password") {
             guard let username = credentials.username, !username.isEmpty else {
-                callbacks.failed(.openVPN, .init(.authenticationRequired, "Рабочий VPN требует логин и пароль: укажите их в «Профилях»"))
+                callbacks.failed(tunnel.id, .init(.authenticationRequired, "«\(tunnel.title)»: OpenVPN требует логин и пароль — укажите их на странице «VPN»"))
                 return
             }
             commands += "username \"\(escape(realm))\" \"\(escape(username))\"\n"
@@ -432,34 +456,34 @@ final class TunnelSupervisor: @unchecked Sendable {
         return String(line[line.index(after: open)..<close])
     }
 
-    private func parseOpenVPNLine(_ line: String) {
+    private func parseOpenVPNLine(_ line: String, _ tunnel: Tunnel) {
         if let match = line.range(of: "utun[0-9]+", options: .regularExpression) {
-            openVPNInterface = String(line[match])
+            tunnel.interface = String(line[match])
         }
         // ">STATE:1699,WAIT,,,,,," — the second field names the step and carries no
         // host or address, so journalling it says where a stall happened without
         // putting anything from the profile into diagnostics.
         if line.hasPrefix(">STATE:"), let step = line.dropFirst(7).split(separator: ",", omittingEmptySubsequences: false).dropFirst().first {
-            callbacks.note("OpenVPN state: \(step)")
+            callbacks.note("«\(tunnel.title)» OpenVPN state: \(step)")
         }
         if line.contains(",CONNECTED,SUCCESS") || line.contains("Initialization Sequence Completed") {
-            openVPNConnected = true
-            callbacks.status(.openVPN, .init(phase: .connected, interfaceName: openVPNInterface))
+            tunnel.connected = true
+            callbacks.status(tunnel.id, .init(phase: .connected, interfaceName: tunnel.interface))
         } else if line.contains("RECONNECTING") {
-            callbacks.status(.openVPN, .init(phase: .reconnecting, interfaceName: openVPNInterface))
+            callbacks.status(tunnel.id, .init(phase: .reconnecting, interfaceName: tunnel.interface))
             // Longer than a first connect: openvpn holds before each retry and the
             // hold is released after its own back-off, up to thirty seconds.
-            startOpenVPNDeadline(90, reconnect: true)
+            startOpenVPNDeadline(tunnel, 90, reconnect: true)
         }
-        let pushed = OpenVPNProfileParser.pushedOptions(from: line)
         if line.contains("PUSH_REPLY,") {
-            callbacks.pushedOptions(pushed.routes, pushed.dns, pushed.domains)
+            let pushed = OpenVPNProfileParser.pushedOptions(from: line)
+            callbacks.pushedOptions(tunnel.id, .init(routes: pushed.routes, dns: pushed.dns, domains: pushed.domains))
         }
     }
 
-    private func startHealthMonitoring(interface: String, endpoint: String) {
-        healthTask?.cancel()
-        healthTask = Task.detached { [weak self] in
+    private func startHealthMonitoring(_ tunnel: Tunnel, interface: String, endpoint: String) {
+        tunnel.health?.cancel()
+        tunnel.health = Task.detached { [weak self, weak tunnel] in
             // The grace period runs from when the handshake first looked stale, not
             // from the start. The clock keeps counting through sleep, so after every
             // wake the last handshake is always ancient: measured from the start, that
@@ -469,31 +493,32 @@ final class TunnelSupervisor: @unchecked Sendable {
             var seenHandshake = false
             var reportedStale = false
             while !Task.isCancelled {
-                guard let self else { return }
+                guard let self, let tunnel else { return }
+                let source = "amneziawg:\(tunnel.slot)"
                 let result = try? self.runner.run(self.toolPath(environment: "VPNROUTER_AWG_TOOL", name: "awg"), ["show", interface, "latest-handshakes"])
                 let newest = result?.stdout.split(whereSeparator: \ .isWhitespace).compactMap { TimeInterval($0) }.max() ?? 0
                 let age = Date().timeIntervalSince1970 - newest
                 // Keepalive re-handshakes about every 120s, so anything past 165
                 // is already a tunnel in trouble and must not read as "protected".
                 if newest > 0, age <= 165 {
-                    if reportedStale { TunnelLog.shared.write("amneziawg", "рукопожатие снова свежее: \(Int(age)) с") }
+                    if reportedStale { TunnelLog.shared.write(source, "рукопожатие снова свежее: \(Int(age)) с") }
                     staleSince = Date()
                     seenHandshake = true
                     reportedStale = false
-                    self.callbacks.status(.amneziaWG, .init(phase: .connected, interfaceName: interface))
+                    self.callbacks.status(tunnel.id, .init(phase: .connected, interfaceName: interface))
                 } else {
                     if !reportedStale {
                         reportedStale = true
-                        TunnelLog.shared.write("amneziawg", newest > 0
+                        TunnelLog.shared.write(source, newest > 0
                             ? "рукопожатию \(Int(age)) с — жду, пока туннель восстановится сам"
                             : "рукопожатия ещё не было — жду")
                     }
-                    if seenHandshake { self.callbacks.status(.amneziaWG, .init(phase: .reconnecting, interfaceName: interface)) }
+                    if seenHandshake { self.callbacks.status(tunnel.id, .init(phase: .reconnecting, interfaceName: interface)) }
                     if Date().timeIntervalSince(staleSince) > 35 {
-                        self.logDiagnostics(interface: interface, endpoint: endpoint)
-                        self.callbacks.failed(.amneziaWG, .init(
+                        self.logDiagnostics(source: source, interface: interface, endpoint: endpoint)
+                        self.callbacks.failed(tunnel.id, .init(
                             .tunnelFailure,
-                            seenHandshake ? "Сервер личного VPN перестал отвечать" : "Личный VPN не достучался до сервера за 35 секунд",
+                            seenHandshake ? "«\(tunnel.title)»: сервер перестал отвечать" : "«\(tunnel.title)»: не достучались до сервера за 35 секунд",
                             recoverable: true
                         ))
                         return
@@ -507,11 +532,11 @@ final class TunnelSupervisor: @unchecked Sendable {
         }
     }
 
-    /// Written when the personal tunnel gives up: where its packets would go, and
-    /// whether our own firewall is what stops them. Addresses reach the log as
+    /// Written when a tunnel gives up: where its packets would go, and whether
+    /// our own firewall is what stops them. Addresses reach the log as
     /// aliases — TunnelLog redacts them.
-    private func logDiagnostics(interface: String, endpoint: String) {
-        let note = { TunnelLog.shared.write("amneziawg", $0) }
+    private func logDiagnostics(source: String, interface: String, endpoint: String) {
+        let note = { TunnelLog.shared.write(source, $0) }
         guard let address = IPAddress(endpoint)?.description ?? HostResolver.addresses(endpoint).first else {
             note("адрес сервера не резолвится — рукопожатию некуда идти")
             return

@@ -5,11 +5,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SOURCE_DIR="$ROOT/.build/vendor-src"
 OUTPUT_DIR="$ROOT/Vendor/bin/arm64"
 ARCHIVE_DIR="$ROOT/Vendor/sources"
-OPENVPN_TAG="v2.6.21"
+OPENVPN_TAG="v2.6.23"
 AWG_GO_TAG="v3.1.20260828"
 # 3.x: v1.0 does not know the AmneziaWG 3 interface keys and rejects such profiles.
 AWG_TOOLS_TAG="v3.1.20260812"
-XRAY_TAG="v26.9.9"
+XRAY_TAG="v26.9.30"
 
 for tool in git go make autoreconf automake pkg-config brew; do
     command -v "$tool" >/dev/null || {
@@ -72,6 +72,9 @@ checkout https://github.com/OpenVPN/openvpn.git "$OPENVPN_TAG" "$SOURCE_DIR/open
         OPENSSL_LIBS="$OPENSSL_PREFIX/lib/libssl.a $OPENSSL_PREFIX/lib/libcrypto.a" \
         LZO_CFLAGS="-I$LZO_PREFIX/include" LZO_LIBS="$LZO_PREFIX/lib/liblzo2.a" \
         LZ4_CFLAGS="-I$LZ4_PREFIX/include" LZ4_LIBS="$LZ4_PREFIX/lib/liblz4.a"
+    # In a git checkout the sources include config-version.h, which only the
+    # top-level Makefile generates; the per-directory builds below do not.
+    make config-version.h
     make -C src/compat -j "$(sysctl -n hw.logicalcpu)"
     make -C src/openvpn -j "$(sysctl -n hw.logicalcpu)"
     cp src/openvpn/openvpn "$OUTPUT_DIR/openvpn"

@@ -69,20 +69,18 @@ public struct XraySummary: Codable, Equatable, Sendable {
     }
 }
 
-/// A change to the Xray exit: share links or an https subscription URL to
-/// replace what is there, a server to switch to, or a subscription refresh.
+/// A change to one Xray connection: share links or an https subscription URL
+/// to put there, or a subscription refresh. An id nothing has yet adds it.
+/// Which server runs is each route's choice, in `Direction.server`.
 public struct XrayUpdate: Codable, Sendable {
+    public var connection: UUID
     public var source: String?
-    public var selected: Int?
     public var refresh: Bool
-    /// The subscription's User-Agent; empty goes back to ours.
-    public var userAgent: String?
 
-    public init(source: String? = nil, selected: Int? = nil, refresh: Bool = false, userAgent: String? = nil) {
+    public init(connection: UUID, source: String? = nil, refresh: Bool = false) {
+        self.connection = connection
         self.source = source
-        self.selected = selected
         self.refresh = refresh
-        self.userAgent = userAgent
     }
 }
 
@@ -131,8 +129,12 @@ public enum XrayProfileParser {
         "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305",
     ]
     /// The TUN's own address: 198.18/15 is set aside for benchmarking, so it
-    /// collides with no LAN and no corporate range.
-    private static let gateway = "198.18.0.1/30"
+    /// collides with no LAN and no corporate range. One /30 per slot: two Xray
+    /// tunnels up at once must not claim the same address.
+    static func gateway(slot: Int) -> String {
+        let base = 4 * (slot % 16_384)
+        return "198.18.\(base / 256).\(base % 256 + 1)/30"
+    }
 
     // MARK: - Input
 
@@ -223,7 +225,7 @@ public enum XrayProfileParser {
     // MARK: - Output
 
     /// The whole config Xray runs with: our TUN, our probe door, their server.
-    public static func configuration(for server: XrayServer, interface: String, physicalInterface: String, probe: XrayProbe) throws -> String {
+    public static func configuration(for server: XrayServer, interface: String, physicalInterface: String, probe: XrayProbe, slot: Int = 0) throws -> String {
         guard let outbounds = try? JSONSerialization.jsonObject(with: Data(server.outbounds.utf8)) as? [[String: Any]], !outbounds.isEmpty else {
             throw invalid("Запись сервера Xray повреждена: добавьте его заново")
         }
@@ -236,7 +238,7 @@ public enum XrayProfileParser {
                     "tag": "tun", "protocol": "tun",
                     // Every outbound leaves on the physical interface whatever the
                     // routes say, so the tunnel can never swallow its own server.
-                    "settings": ["name": interface, "mtu": 1500, "gateway": [gateway], "autoOutboundsInterface": physicalInterface] as [String: Any],
+                    "settings": ["name": interface, "mtu": 1500, "gateway": [gateway(slot: slot)], "autoOutboundsInterface": physicalInterface] as [String: Any],
                 ],
                 [
                     "tag": "probe", "protocol": "socks", "listen": "127.0.0.1", "port": probe.port,

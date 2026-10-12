@@ -96,6 +96,35 @@ public struct DNSMessage: Sendable {
         return response
     }
 
+    /// The same answer with no record kept longer than `limit` seconds. The
+    /// daemon forgets which route an address belongs to a minute after the
+    /// answer; a cache holding the address longer would send new connections
+    /// past that route. Anything it cannot walk comes back unchanged.
+    public static func cappingTTL(_ data: Data, to limit: UInt32) -> Data {
+        var bytes = [UInt8](data)
+        guard bytes.count >= 12 else { return data }
+        let questionCount = Int(read16(bytes, 4))
+        let recordCount = Int(read16(bytes, 6)) + Int(read16(bytes, 8)) + Int(read16(bytes, 10))
+        var offset = 12
+        do {
+            for _ in 0..<questionCount {
+                _ = try readName(bytes, offset: &offset)
+                offset += 4
+            }
+            for _ in 0..<recordCount {
+                _ = try readName(bytes, offset: &offset)
+                guard offset + 10 <= bytes.count else { return data }
+                // OPT (41) keeps flags where other records keep their TTL.
+                if read16(bytes, offset) != 41, read32(bytes, offset + 4) > limit {
+                    for index in 0..<4 { bytes[offset + 4 + index] = UInt8((limit >> (24 - 8 * UInt32(index))) & 0xff) }
+                }
+                offset += 10 + Int(read16(bytes, offset + 8))
+                guard offset <= bytes.count else { return data }
+            }
+        } catch { return data }
+        return Data(bytes)
+    }
+
     private static func readName(_ bytes: [UInt8], offset: inout Int) throws -> String {
         var labels: [String] = []
         var cursor = offset

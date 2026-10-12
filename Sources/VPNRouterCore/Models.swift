@@ -1,5 +1,7 @@
 import Foundation
 
+/// The two kinds a profile file or pasted text can be; Xray arrives as links
+/// through `XrayUpdate` instead.
 public enum VPNKind: String, Codable, CaseIterable, Sendable {
     case openVPN
     case amneziaWG
@@ -7,16 +9,15 @@ public enum VPNKind: String, Codable, CaseIterable, Sendable {
     public var title: String { self == .openVPN ? "OpenVPN" : "AmneziaWG" }
 }
 
-/// What carries the traffic no rule claims. Both fill the same slot: the
-/// `.amneziaWG` kind, class and status stand for that slot, whichever it is.
+/// The engine a pasted personal profile is for, so nobody has to pick a type
+/// before adding one.
 public enum ExitEngine: String, Codable, CaseIterable, Sendable {
     case amneziaWG, xray
 
     public var title: String { self == .amneziaWG ? "AmneziaWG" : "Xray" }
 
-    /// The engine a pasted profile is for, so nobody has to pick a type before
-    /// adding one: Amnezia's vpn:// link and a WireGuard-style config are
-    /// AmneziaWG, anything else is a share link or a subscription address.
+    /// Amnezia's vpn:// link and a WireGuard-style config are AmneziaWG,
+    /// anything else is a share link or a subscription address.
     public init(profile text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         self = trimmed.lowercased().hasPrefix("vpn://") || trimmed.contains("[Interface]") ? .amneziaWG : .xray
@@ -35,6 +36,10 @@ public enum TunnelPhase: String, Codable, Sendable {
         case .error: "Ошибка"
         }
     }
+
+    /// Deleting the profile behind a tunnel that is up, coming up or
+    /// recovering would pull the rug out from under a live connection.
+    public var blocksDeletion: Bool { self == .connected || self == .connecting || self == .reconnecting }
 }
 
 public enum ProtectionState: String, Codable, Sendable {
@@ -52,16 +57,33 @@ public enum ProtectionState: String, Codable, Sendable {
         }
     }
 
-    /// A tunnel passed as nil is not in use and counts neither way.
-    public static func evaluate(desiredEnabled: Bool, openVPN: TunnelStatus?, amneziaWG: TunnelStatus?) -> Self {
-        let used = [openVPN, amneziaWG].compactMap { $0 }
-        guard desiredEnabled, !used.isEmpty else { return .off }
-        if used.allSatisfy({ $0.phase == .connected && $0.interfaceName != nil }) { return .protected }
-        // One tunnel up while the other is still on its first attempt is a
+    /// Over the tunnels of the routes that are on; none means only routes
+    /// without a VPN, which have nothing to be down.
+    public static func evaluate(desiredEnabled: Bool, tunnels: [TunnelStatus]) -> Self {
+        guard desiredEnabled else { return .off }
+        if tunnels.allSatisfy({ $0.phase == .connected && $0.interfaceName != nil }) { return .protected }
+        // One tunnel up while another is still on its first attempt is a
         // normal start: calling it «Работает частично» read as a failure.
-        let phases = used.map(\.phase)
+        let phases = tunnels.map(\.phase)
         if phases.contains(.connecting), phases.allSatisfy({ $0 == .connecting || $0 == .connected }) { return .starting }
         return .degraded
+    }
+}
+
+/// What an OpenVPN server sent at connect: its networks, its DNS and its
+/// domains, shown on «Маршруты» so nobody retypes them as rules.
+public struct PushedOptions: Codable, Equatable, Sendable {
+    public var routes: [String]
+    public var dns: [String]
+    public var domains: [String]
+    /// When the server last sent them: kept and shown after the VPN is off.
+    public var receivedAt: Date?
+
+    public init(routes: [String] = [], dns: [String] = [], domains: [String] = [], receivedAt: Date? = nil) {
+        self.routes = routes
+        self.dns = dns
+        self.domains = domains
+        self.receivedAt = receivedAt
     }
 }
 
@@ -87,91 +109,87 @@ public struct TunnelStatus: Codable, Equatable, Sendable {
     }
 }
 
-/// What the daemon holds, reported so the app never reads it back out of
-/// Keychain. The password itself never crosses XPC in this direction.
-public struct ProfileSummary: Codable, Equatable, Sendable {
-    public var hasOpenVPN: Bool
-    public var hasAmneziaWG: Bool
-    /// Only a profile with `auth-user-pass` is ever asked for a login.
-    public var openVPNNeedsLogin: Bool
-    public var openVPNUsername: String?
-    public var openVPNHasPassword: Bool
+/// A saved VPN as the app lists it on «VPN». Secrets stay in the daemon: the
+/// password is only ever reported as there or not.
+public struct ConnectionSummary: Codable, Equatable, Identifiable, Sendable {
+    public enum Kind: String, Codable, Sendable {
+        case openVPN, amneziaWG, xray
+
+        public var title: String {
+            switch self {
+            case .openVPN: "OpenVPN"
+            case .amneziaWG: "AmneziaWG"
+            case .xray: "Xray"
+            }
+        }
+    }
+
+    public var id: UUID
+    public var kind: Kind
+    public var title: String
+    /// A non-secret second line: the server it dials.
+    public var detail: String?
+    /// A single, known protocol. Subscriptions with potentially mixed servers
+    /// deliberately leave this empty.
+    public var protocolTitle: String?
+    /// OpenVPN: only a profile with `auth-user-pass` is ever asked for a login.
+    public var needsLogin: Bool
+    public var username: String?
+    public var hasPassword: Bool
+    /// OpenVPN: every server the profile names, and the one tried first.
+    public var remotes: [OpenVPNRemote]?
+    public var preferredRemote: OpenVPNRemote?
+    /// OpenVPN: what its server last sent, and the `route` lines of the profile.
+    public var pushed: PushedOptions?
+    public var profileRoutes: [String]?
     public var xray: XraySummary?
-    /// Which server each profile dials, so «Сохранён» says which one. Optional:
-    /// a daemon from before they were sent reports neither.
-    public var openVPNServer: String?
-    public var amneziaWGServer: String?
-    /// Every server the work profile names, to pick the one tried first.
-    public var openVPNRemotes: [OpenVPNRemote]?
-    /// Every saved personal profile, the ones in use and the spares.
-    public var exits: [ExitItem]?
 
     public init(
-        hasOpenVPN: Bool = false,
-        hasAmneziaWG: Bool = false,
-        openVPNNeedsLogin: Bool = false,
-        openVPNUsername: String? = nil,
-        openVPNHasPassword: Bool = false,
-        xray: XraySummary? = nil,
-        openVPNServer: String? = nil,
-        amneziaWGServer: String? = nil,
-        openVPNRemotes: [OpenVPNRemote]? = nil,
-        exits: [ExitItem]? = nil
+        id: UUID, kind: Kind, title: String, detail: String? = nil, protocolTitle: String? = nil,
+        needsLogin: Bool = false, username: String? = nil, hasPassword: Bool = false,
+        remotes: [OpenVPNRemote]? = nil, preferredRemote: OpenVPNRemote? = nil,
+        pushed: PushedOptions? = nil, profileRoutes: [String]? = nil, xray: XraySummary? = nil
     ) {
-        self.openVPNRemotes = openVPNRemotes
-        self.exits = exits
-        self.hasOpenVPN = hasOpenVPN
-        self.hasAmneziaWG = hasAmneziaWG
-        self.openVPNNeedsLogin = openVPNNeedsLogin
-        self.openVPNUsername = openVPNUsername
-        self.openVPNHasPassword = openVPNHasPassword
-        self.xray = xray
-        self.openVPNServer = openVPNServer
-        self.amneziaWGServer = amneziaWGServer
-    }
-}
-
-/// A saved personal profile. The daemon runs one per engine; the rest are
-/// spares, kept whole until chosen. `spare` nil is the engine's current one.
-public struct ExitItem: Codable, Hashable, Identifiable, Sendable {
-    public var engine: ExitEngine
-    public var spare: UUID?
-    public var title: String
-
-    public var id: String { spare?.uuidString ?? engine.rawValue }
-
-    public init(engine: ExitEngine, spare: UUID? = nil, title: String) {
-        self.engine = engine
-        self.spare = spare
+        self.pushed = pushed
+        self.profileRoutes = profileRoutes
+        self.id = id
+        self.kind = kind
         self.title = title
+        self.detail = detail
+        self.protocolTitle = protocolTitle
+        self.needsLogin = needsLogin
+        self.username = username
+        self.hasPassword = hasPassword
+        self.remotes = remotes
+        self.preferredRemote = preferredRemote
+        self.xray = xray
     }
 }
 
 public struct RouterStatus: Codable, Equatable, Sendable {
     public var protection: ProtectionState
-    public var openVPN: TunnelStatus
-    public var amneziaWG: TunnelStatus
+    /// The tunnel of each route that is on and has a VPN, by route id.
+    public var tunnels: [UUID: TunnelStatus]
     public var desiredEnabled: Bool
     public var lastError: RouterErrorInfo?
-    public var profiles: ProfileSummary
+    public var connections: [ConnectionSummary]
 
     public init(
         protection: ProtectionState = .off,
-        openVPN: TunnelStatus = .init(),
-        amneziaWG: TunnelStatus = .init(),
+        tunnels: [UUID: TunnelStatus] = [:],
         desiredEnabled: Bool = false,
         lastError: RouterErrorInfo? = nil,
-        profiles: ProfileSummary = .init()
+        connections: [ConnectionSummary] = []
     ) {
         self.protection = protection
-        self.openVPN = openVPN
-        self.amneziaWG = amneziaWG
+        self.tunnels = tunnels
         self.desiredEnabled = desiredEnabled
         self.lastError = lastError
-        self.profiles = profiles
+        self.connections = connections
     }
 }
 
+/// Only for reading settings saved before routes: which list a rule was in.
 public enum RuleTarget: String, Codable, CaseIterable, Sendable {
     case corporate, direct
 }
@@ -182,14 +200,15 @@ public enum RuleKind: String, Codable, CaseIterable, Sendable {
 
 public struct RoutingRule: Identifiable, Codable, Hashable, Sendable {
     public var id: UUID
-    public var target: RuleTarget
+    /// Set only in settings from before routes; a route's own rules have none.
+    public var target: RuleTarget?
     public var kind: RuleKind
     public var value: String
     public var enabled: Bool
 
     public init(
         id: UUID = UUID(),
-        target: RuleTarget,
+        target: RuleTarget? = nil,
         kind: RuleKind,
         value: String,
         enabled: Bool = true
@@ -202,88 +221,202 @@ public struct RoutingRule: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
-public struct RouterSettings: Codable, Equatable, Sendable {
+/// A subscription server, by what survives a refresh: its index does not.
+public struct ServerChoice: Codable, Hashable, Sendable {
+    public var name: String
+    public var host: String
+    /// Optional so a pick saved before they were kept still decodes; one
+    /// without them matches the first server of that name and host.
+    public var port: Int?
+    public var protocolName: String?
+
+    public init(name: String, host: String, port: Int? = nil, protocolName: String? = nil) {
+        self.name = name
+        self.host = host
+        self.port = port
+        self.protocolName = protocolName
+    }
+
+    public init(_ server: XraySummary.Server) {
+        self.init(name: server.name, host: server.host ?? "", port: server.port, protocolName: server.protocolName)
+    }
+
+    /// One rule for the app and the daemon: a subscription may list servers
+    /// that differ only by port or protocol.
+    public func matches(name: String, host: String?, port: Int?, protocolName: String) -> Bool {
+        name == self.name && (host ?? "") == self.host
+            && (self.port == nil || port == self.port)
+            && (self.protocolName == nil || protocolName == self.protocolName)
+    }
+}
+
+/// A named list of sites and the VPN they go through. Routes are ordered: when
+/// two claim the same site, the one higher on the list wins.
+public struct Direction: Codable, Hashable, Identifiable, Sendable {
+    public enum Path: Codable, Hashable, Sendable {
+        /// No VPN: straight out through the network.
+        case direct
+        case vpn(UUID)
+        /// Imported, or left by a deleted VPN. Never runs as "direct": that
+        /// would send work sites out to the internet.
+        case unset
+    }
+
+    public var id: UUID
+    public var name: String
+    public var path: Path
+    /// A subscription's server; nil runs the one the subscription starts with.
+    public var server: ServerChoice?
     public var rules: [RoutingRule]
-    public var directRU: Bool
-    public var directSU: Bool
-    public var directRF: Bool
-    public var corporateDNSFallbackToCurrent: Bool
+    public var enabled: Bool
+    /// The kill switch: while its VPN is down, blocked, or straight out until
+    /// it is back.
+    public var blockWhenDown: Bool
+
+    public init(
+        id: UUID = UUID(), name: String, path: Path, server: ServerChoice? = nil, rules: [RoutingRule] = [],
+        enabled: Bool = true, blockWhenDown: Bool = true
+    ) {
+        self.id = id
+        self.name = name
+        self.path = path
+        self.server = server
+        self.rules = rules
+        self.enabled = enabled
+        self.blockWhenDown = blockWhenDown
+    }
+
+    public var connection: UUID? {
+        if case .vpn(let id) = path { return id }
+        return nil
+    }
+}
+
+/// Fixed ids for what settings from before routes become, so the app and the
+/// daemon, migrating each its own copy, arrive at the same routes.
+public enum LegacyIDs {
+    public static let openVPN = UUID(uuidString: "C0DE0000-0000-4000-8000-000000000001")!
+    public static let amneziaWG = UUID(uuidString: "C0DE0000-0000-4000-8000-000000000002")!
+    public static let xray = UUID(uuidString: "C0DE0000-0000-4000-8000-000000000003")!
+    public static let work = UUID(uuidString: "C0DE0000-0000-4000-8000-000000000011")!
+    public static let direct = UUID(uuidString: "C0DE0000-0000-4000-8000-000000000012")!
+    public static let personal = UUID(uuidString: "C0DE0000-0000-4000-8000-000000000013")!
+}
+
+public struct RouterSettings: Codable, Equatable, Sendable {
+    public var directions: [Direction]
+    /// Takes what no rule claims. nil, or a route that is off, sends it
+    /// straight out.
+    public var defaultDirection: UUID?
     public var launchAtLogin: Bool
-    /// Either VPN can sit out. Without OpenVPN the corporate rules do not apply;
-    /// without AmneziaWG whatever no rule claims goes out directly.
-    public var useOpenVPN: Bool
-    public var useAmneziaWG: Bool
-    /// While AmneziaWG is down, what no rule claims is blocked along with its
-    /// DNS; switched off, it goes out directly until the tunnel is back.
-    public var killSwitch: Bool
-    public var exitEngine: ExitEngine
-    /// The work server openvpn tries first; nil keeps the profile's order.
-    public var preferredOpenVPNRemote: OpenVPNRemote?
     /// The «Трафик» tab records only when asked: nettop costs CPU for as long
     /// as it runs, and most days no one looks.
     public var watchTraffic: Bool
+    /// What every subscription is fetched with; nil is ours.
+    public var subscriptionUserAgent: String?
 
+    /// A fresh install: the same three routes settings from 1.0.7 become, so a
+    /// newcomer starts where most end up. Work and personal wait, off, for a
+    /// VPN: a route that is on yet cannot run would block «Включить». The
+    /// personal one takes the rest; .ru and friends go direct.
     public init(
-        rules: [RoutingRule] = [],
-        directRU: Bool = true,
-        directSU: Bool = true,
-        directRF: Bool = true,
-        corporateDNSFallbackToCurrent: Bool = true,
+        directions: [Direction] = [
+            .init(id: LegacyIDs.work, name: "Работа", path: .unset, enabled: false),
+            .init(id: LegacyIDs.personal, name: "Личный", path: .unset, enabled: false),
+            .init(id: LegacyIDs.direct, name: "Напрямую", path: .direct, rules: RouterSettings.zoneRules(ru: true, su: true, rf: true)),
+        ],
+        defaultDirection: UUID? = LegacyIDs.personal,
         launchAtLogin: Bool = false,
-        useOpenVPN: Bool = true,
-        useAmneziaWG: Bool = true,
-        killSwitch: Bool = true,
-        exitEngine: ExitEngine = .amneziaWG,
-        preferredOpenVPNRemote: OpenVPNRemote? = nil,
-        watchTraffic: Bool = false
+        watchTraffic: Bool = false,
+        subscriptionUserAgent: String? = nil
     ) {
-        self.preferredOpenVPNRemote = preferredOpenVPNRemote
-        self.watchTraffic = watchTraffic
-        self.killSwitch = killSwitch
-        self.exitEngine = exitEngine
-        self.rules = rules
-        self.directRU = directRU
-        self.directSU = directSU
-        self.directRF = directRF
-        self.corporateDNSFallbackToCurrent = corporateDNSFallbackToCurrent
+        self.directions = directions
+        self.defaultDirection = defaultDirection
         self.launchAtLogin = launchAtLogin
-        self.useOpenVPN = useOpenVPN
-        self.useAmneziaWG = useAmneziaWG
+        self.watchTraffic = watchTraffic
+        self.subscriptionUserAgent = subscriptionUserAgent
+    }
+
+    /// Routes whose VPN the daemon does not have wait, off, for another. Settings
+    /// from 1.0.7 point work and personal at fixed ids whether or not that profile
+    /// was ever saved: only the daemon knows, so this is how they carry over as they
+    /// were — one VPN stays one, two stay two — instead of blocking «Включить».
+    public func droppingMissing(live: Set<UUID>) -> RouterSettings {
+        var result = self
+        for index in result.directions.indices {
+            guard let id = result.directions[index].connection, !live.contains(id) else { continue }
+            result.directions[index].path = .unset
+            result.directions[index].enabled = false
+            result.directions[index].server = nil
+        }
+        return result
     }
 
     private enum CodingKeys: String, CodingKey {
-        case rules, directRU, directSU, directRF, corporateDNSFallbackToCurrent, launchAtLogin, useOpenVPN, useAmneziaWG, killSwitch, exitEngine
-        case preferredOpenVPNRemote, watchTraffic
+        case directions, defaultDirection, launchAtLogin, watchTraffic, subscriptionUserAgent
+        // Before routes; read once, never written.
+        case rules, directRU, directSU, directRF, useOpenVPN, useAmneziaWG, killSwitch, exitEngine
     }
 
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
-        rules = try values.decodeIfPresent([RoutingRule].self, forKey: .rules) ?? []
-        directRU = try values.decodeIfPresent(Bool.self, forKey: .directRU) ?? true
-        directSU = try values.decodeIfPresent(Bool.self, forKey: .directSU) ?? true
-        directRF = try values.decodeIfPresent(Bool.self, forKey: .directRF) ?? true
-        corporateDNSFallbackToCurrent = try values.decodeIfPresent(Bool.self, forKey: .corporateDNSFallbackToCurrent) ?? true
         launchAtLogin = try values.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false
-        useOpenVPN = try values.decodeIfPresent(Bool.self, forKey: .useOpenVPN) ?? true
-        useAmneziaWG = try values.decodeIfPresent(Bool.self, forKey: .useAmneziaWG) ?? true
-        killSwitch = try values.decodeIfPresent(Bool.self, forKey: .killSwitch) ?? true
-        exitEngine = try values.decodeIfPresent(ExitEngine.self, forKey: .exitEngine) ?? .amneziaWG
-        preferredOpenVPNRemote = try values.decodeIfPresent(OpenVPNRemote.self, forKey: .preferredOpenVPNRemote)
         watchTraffic = try values.decodeIfPresent(Bool.self, forKey: .watchTraffic) ?? false
+        subscriptionUserAgent = try values.decodeIfPresent(String.self, forKey: .subscriptionUserAgent)
+        if let directions = try values.decodeIfPresent([Direction].self, forKey: .directions) {
+            self.directions = directions
+            defaultDirection = try values.decodeIfPresent(UUID.self, forKey: .defaultDirection)
+            return
+        }
+        // The work list, the direct list and whatever carried the rest become
+        // three routes, in the order that keeps the old precedence: work first.
+        let rules = try values.decodeIfPresent([RoutingRule].self, forKey: .rules) ?? []
+        func list(_ target: RuleTarget) -> [RoutingRule] {
+            rules.filter { $0.target == target }.map { var rule = $0; rule.target = nil; return rule }
+        }
+        let exit = try values.decodeIfPresent(ExitEngine.self, forKey: .exitEngine) ?? .amneziaWG
+        directions = [
+            .init(
+                id: LegacyIDs.work, name: "Работа", path: .vpn(LegacyIDs.openVPN), rules: list(.corporate),
+                enabled: try values.decodeIfPresent(Bool.self, forKey: .useOpenVPN) ?? true
+            ),
+            .init(
+                id: LegacyIDs.direct, name: "Напрямую", path: .direct,
+                rules: Self.zoneRules(
+                    ru: try values.decodeIfPresent(Bool.self, forKey: .directRU) ?? true,
+                    su: try values.decodeIfPresent(Bool.self, forKey: .directSU) ?? true,
+                    rf: try values.decodeIfPresent(Bool.self, forKey: .directRF) ?? true
+                ) + list(.direct)
+            ),
+            .init(
+                id: LegacyIDs.personal, name: "Личный", path: .vpn(exit == .xray ? LegacyIDs.xray : LegacyIDs.amneziaWG),
+                enabled: try values.decodeIfPresent(Bool.self, forKey: .useAmneziaWG) ?? true,
+                blockWhenDown: try values.decodeIfPresent(Bool.self, forKey: .killSwitch) ?? true
+            ),
+        ]
+        defaultDirection = LegacyIDs.personal
     }
 
-    /// What no rule claims leaves on the physical interface: always without
-    /// AmneziaWG, and while it is down if the kill switch is off.
-    public func directByDefault(amneziaWGUp: Bool) -> Bool {
-        !useAmneziaWG || (!killSwitch && !amneziaWGUp)
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(directions, forKey: .directions)
+        try values.encodeIfPresent(defaultDirection, forKey: .defaultDirection)
+        try values.encode(launchAtLogin, forKey: .launchAtLogin)
+        try values.encode(watchTraffic, forKey: .watchTraffic)
+        try values.encodeIfPresent(subscriptionUserAgent, forKey: .subscriptionUserAgent)
     }
 
-    public var effectiveRules: [RoutingRule] {
-        var result = rules
-        if directRU { result.append(.init(target: .direct, kind: .domain, value: "ru")) }
-        if directSU { result.append(.init(target: .direct, kind: .domain, value: "su")) }
-        if directRF { result.append(.init(target: .direct, kind: .domain, value: "xn--p1ai")) }
-        return result
+    /// The zone boxes of old, as the lines they now are.
+    public static func zoneRules(ru: Bool, su: Bool, rf: Bool) -> [RoutingRule] {
+        [(ru, ".ru"), (su, ".su"), (rf, ".рф")].filter(\.0).map { .init(kind: .domain, value: $0.1) }
+    }
+
+    /// The routes that are on, in their order.
+    public var activeDirections: [Direction] { directions.filter(\.enabled) }
+
+    /// What carries the rest, if a route that is on does.
+    public var activeDefault: Direction? {
+        directions.first { $0.id == defaultDirection && $0.enabled }
     }
 }
 
@@ -293,34 +426,49 @@ public struct ProfilePayload: Codable, Sendable {
     public var username: String?
     public var password: String?
     public var unsafeAuthorization: Data?
-    /// A newly added personal profile: the current one is kept as a spare
-    /// instead of replaced, as «Изменить…» does. Never stored.
-    public var keepPrevious: Bool?
+    /// Which saved VPN this is. One the daemon does not have yet is added under
+    /// it: the app picks the id, so it knows it without asking.
+    public var connection: UUID?
 
     public init(
         kind: VPNKind,
         configuration: String,
         username: String? = nil,
         password: String? = nil,
-        unsafeAuthorization: Data? = nil
+        unsafeAuthorization: Data? = nil,
+        connection: UUID? = nil
     ) {
         self.kind = kind
         self.configuration = configuration
         self.username = username
         self.password = password
         self.unsafeAuthorization = unsafeAuthorization
+        self.connection = connection
     }
 }
 
 /// A nil password means "keep the stored one": the app cannot show it, so an
 /// empty field must never wipe it.
 public struct CredentialsUpdate: Codable, Sendable {
+    public var connection: UUID
     public var username: String?
     public var password: String?
 
-    public init(username: String?, password: String?) {
+    public init(connection: UUID, username: String?, password: String?) {
+        self.connection = connection
         self.username = username
         self.password = password
+    }
+}
+
+/// The OpenVPN server to try first; the rest follow in the profile's order.
+public struct RemotePreference: Codable, Sendable {
+    public var connection: UUID
+    public var remote: OpenVPNRemote
+
+    public init(connection: UUID, remote: OpenVPNRemote) {
+        self.connection = connection
+        self.remote = remote
     }
 }
 
@@ -354,7 +502,7 @@ public struct RouterErrorInfo: Error, LocalizedError, Codable, Equatable, Sendab
 }
 
 public enum VPNRouterVersion {
-    public static let current = "1.0.7"
+    public static let current = "1.1.0"
 
     /// Numeric per component: "1.0.10" is newer than "1.0.9". A leading "v"
     /// is the release tag's, not the version's.
@@ -397,23 +545,17 @@ public struct Diagnostics: Codable, Sendable {
     public var daemonVersion: String
     public var status: RouterStatus
     public var physicalInterface: String?
-    public var openVPNInterface: String?
-    public var amneziaWGInterface: String?
 
     public init(
         appVersion: String = VPNRouterVersion.current,
         daemonVersion: String = VPNRouterVersion.current,
         status: RouterStatus,
-        physicalInterface: String? = nil,
-        openVPNInterface: String? = nil,
-        amneziaWGInterface: String? = nil
+        physicalInterface: String? = nil
     ) {
         self.appVersion = appVersion
         self.daemonVersion = daemonVersion
         self.status = status
         self.physicalInterface = physicalInterface
-        self.openVPNInterface = openVPNInterface
-        self.amneziaWGInterface = amneziaWGInterface
     }
 }
 
@@ -431,8 +573,10 @@ public struct LogChunk: Codable, Sendable {
 public enum IPCOperation: String, Codable, Sendable {
     case getStatus, replaceProfile, updateCredentials, updateRules, setEnabled, getDiagnostics, getLog, lookupNames, updateXray
     case getProfile
-    /// Payload: the `ExitItem` to run, or to forget.
-    case selectExit, deleteExit
+    /// Payload: the id of the saved VPN to forget.
+    case deleteConnection
+    /// Payload: a `RemotePreference`.
+    case preferRemote
     /// Payload: the path of a downloaded Commutator.pkg.
     case installUpdate
     /// Payload: the app bundle's path, removed along with everything else.
@@ -442,11 +586,11 @@ public enum IPCOperation: String, Codable, Sendable {
 /// Asks for a stored profile's text, to edit it in the app. The authorization
 /// is needed only where the daemon takes requests from unsigned clients.
 public struct ProfileRequest: Codable, Sendable {
-    public var kind: VPNKind
+    public var connection: UUID
     public var authorization: Data?
 
-    public init(kind: VPNKind, authorization: Data? = nil) {
-        self.kind = kind
+    public init(connection: UUID, authorization: Data? = nil) {
+        self.connection = connection
         self.authorization = authorization
     }
 }

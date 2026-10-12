@@ -16,6 +16,9 @@ struct RouteCheck: Equatable {
     /// false: nothing answered on 443, and the interface is the routing
     /// table's account instead of the connection's.
     var connected: Bool
+    /// Another site the daemon last resolved to this address: on a shared CDN
+    /// address, the route that site's rule set is the one taken.
+    var sharedWith: String?
 }
 
 /// One request to an address-echo service and what it says about the path.
@@ -31,24 +34,25 @@ struct EchoResult: Equatable {
 
 /// nil in a field means that check got no answer.
 struct ConnectionReport: Equatable {
-    var com: EchoResult?
-    var ru: EchoResult?
-    var corporate: PingState?
+    var cloudflare: EchoResult?
+    var yandex: EchoResult?
     var checkedAt = Date()
 }
 
 enum NetworkProbes {
-    /// Shows the address and country .com sites see.
-    static let comCheck = URL(string: "https://cloudflare.com/cdn-cgi/trace")!
-    /// Shows the address .ru sites see; its country comes from `geo`.
-    static let ruCheck = URL(string: "https://yandex.ru/internet/api/v0/ip")!
+    /// Shows the address and country foreign sites see.
+    static let cloudflareCheck = URL(string: "https://cloudflare.com/cdn-cgi/trace")!
+    /// Shows the address Russian sites see; its country comes from `geo`.
+    static let yandexCheck = URL(string: "https://yandex.ru/internet/api/v0/ip")!
 
     /// How long a server takes to answer, straight from this Mac: TCP to its
     /// port, or ICMP for Hysteria2, which listens on UDP. It says the server
     /// is reachable, not that the proxy on it works.
     static func serverPing(host: String, port: Int, udp: Bool) async -> PingState {
         if udp {
-            let output = await run("/sbin/ping", ["-n", "-q", "-c", "1", "-t", "3", host])
+            // Three packets, not one: a single dropped reply otherwise reads
+            // as the server being down.
+            let output = await run("/sbin/ping", ["-n", "-q", "-c", "3", "-i", "0.2", "-t", "3", host])
             return PingOutput.averageMilliseconds(output).map { .milliseconds($0) } ?? .noReply
         }
         // Resolved first, so the time is the server's and not the resolver's.
@@ -73,8 +77,7 @@ enum NetworkProbes {
     }
 
     /// Bound to the tunnel interface, so a reply can only have come through it.
-    static func ping(_ tunnel: TunnelStatus?) async -> PingState? {
-        guard let tunnel, tunnel.phase == .connected, let interface = tunnel.interfaceName, let target = tunnel.probeAddress else { return nil }
+    static func ping(interface: String, target: String) async -> PingState? {
         let output = await run("/sbin/ping", ["-n", "-q", "-c", "3", "-i", "0.2", "-t", "3", "-b", interface, target])
         return PingOutput.averageMilliseconds(output).map { .milliseconds($0) } ?? .noReply
     }
@@ -100,8 +103,9 @@ enum NetworkProbes {
         return .init(host: host, address: address, interface: interface, milliseconds: nil, connected: false)
     }
 
-    /// An ordinary HTTPS request, routed like any browser's, on a connection of
-    /// its own so the local address it reports belongs to this request.
+    /// An ordinary HTTPS request, routed like any browser's — by the routes,
+    /// VPN on or off — on a connection of its own, so the local address it
+    /// reports names the interface this request took.
     static func echo(_ url: URL) async -> EchoResult? {
         let session = URLSession(configuration: .ephemeral)
         defer { session.finishTasksAndInvalidate() }
@@ -279,13 +283,18 @@ final class TrafficMonitor: ObservableObject {
 
     /// Records while routing is on, since only then is «через что» a question,
     /// and the user has switched recording on.
-    func follow(_ status: RouterStatus, recording: Bool) {
+    func follow(_ status: RouterStatus, directions: [Direction], recording: Bool) {
         // Remembered rather than replaced: a poll that lands mid-reconnect has
         // no interface name, and forgetting ours then labelled our own flows
         // as some other program's tunnel.
-        if let name = status.openVPN.interfaceName { tunnels[name] = VPNKind.openVPN.name }
-        if let name = status.amneziaWG.interfaceName { tunnels[name] = VPNKind.amneziaWG.name }
-        ready = status.protection == .protected || status.amneziaWG.phase == .connected
+        var labels: [String: [String]] = [:]
+        for direction in directions {
+            if let name = status.tunnels[direction.id]?.interfaceName { labels[name, default: []].append(direction.name) }
+        }
+        for (name, routes) in labels { tunnels[name] = routes.joined(separator: ", ") }
+        // Any tunnel up counts: with one route down for hours, «Работает частично»
+        // alone tagged every new direct flow as opened before VPN.
+        ready = status.protection == .protected || status.tunnels.values.contains { $0.phase == .connected }
         // A fresh tunnel carries flows a sample or two before the status names
         // it; those rows were ours all along.
         for index in entries.indices where entries[index].via.hasPrefix("Чужой") {

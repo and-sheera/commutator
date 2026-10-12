@@ -15,6 +15,7 @@ struct VPNRouterApp: App {
             MainWindow(model: delegate.model)
         }
         .defaultSize(width: 820, height: 600)
+        .commands { AppCommands(model: delegate.model) }
 
         MenuBarExtra(isInserted: $showsMenuBarExtra) {
             MenuContent(model: delegate.model)
@@ -22,6 +23,39 @@ struct VPNRouterApp: App {
             MenuBarLabel(model: delegate.model)
         }
         .menuBarExtraStyle(.window)
+    }
+}
+
+/// Commands repeat the actions in the relevant toolbar, so keyboard users do
+/// not have to discover a page-specific control first.
+private struct AppCommands: Commands {
+    @ObservedObject var model: AppModel
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        CommandGroup(replacing: .appSettings) {
+            Button("Настройки…") { show(.general) }
+                .keyboardShortcut(",", modifiers: .command)
+        }
+        CommandMenu("Маршруты") {
+            Button("Скопировать маршруты") { model.exportRules() }
+            // The imported lists fill the draft on «Маршруты»: shown there, or not at all.
+            Button("Вставить маршруты") {
+                model.importRules()
+                show(.rules)
+            }
+            Divider()
+            Button("Как записывать") {
+                model.showsRuleFormat = true
+                show(.rules)
+            }
+        }
+    }
+
+    private func show(_ page: Page) {
+        model.page = page
+        NSApp.activate(ignoringOtherApps: true)
+        openWindow(id: "main")
     }
 }
 
@@ -37,12 +71,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Cmd+Q, the Dock and «Выйти» all land here. Quitting takes VPN down too,
     /// so it is confirmed first while VPN is on.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Logout, restart and shutdown must not wait on a dialog.
+        let quitBySystem = NSAppleEventManager.shared().currentAppleEvent?.attributeDescriptor(forKeyword: AEKeyword(kAEQuitReason)) != nil
+        if !quitBySystem {
+            NSApp.activate(ignoringOtherApps: true)
+            guard model.settleRuleEdits() else { return .terminateCancel }
+        }
         // The demo's VPN is made up: there is nothing to turn off.
         guard model.displayedEnabled, !XPCClient.isDemo else { return .terminateNow }
-        // Logout, restart and shutdown must not wait on a dialog. VPN outlives them
-        // only if the app opens at login to show it is on; otherwise it goes off
-        // quietly, as the daemon also keeps it off after a boot without the app.
-        if NSAppleEventManager.shared().currentAppleEvent?.attributeDescriptor(forKeyword: AEKeyword(kAEQuitReason)) != nil {
+        // VPN outlives logout, restart and shutdown only if the app opens at login
+        // to show it is on; otherwise it goes off quietly, as the daemon also
+        // keeps it off after a boot without the app.
+        if quitBySystem {
             guard !model.settings.launchAtLogin else { return .terminateNow }
             Task {
                 _ = await model.turnOffForQuit()
@@ -75,21 +115,19 @@ private struct MenuBarLabel: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        Image(systemName: model.status.protection.symbol)
-            .accessibilityLabel("Коммутатор: \(model.status.protection.russianTitle)")
+        let state = model.status.protection
+        // A plain symbol at the size the menu bar picks: one sized by hand came
+        // out taller than the bar, cut off and blurry on a 1x display. The bar's
+        // own symbols have no side margins and a larger switch instead.
+        Group {
+            if let lever = state.leverColor {
+                Image(state.menuBarSymbol).symbolRenderingMode(.palette).foregroundStyle(lever, .primary)
+            } else {
+                Image(state.menuBarSymbol)
+            }
+        }
+        .accessibilityLabel("Коммутатор: \(model.status.protection.russianTitle)")
     }
-}
-
-extension VPNKind {
-    /// Which VPN, not which protocol: the protocol only matters where a
-    /// profile is picked.
-    var name: String { self == .openVPN ? "Рабочий VPN" : "Личный VPN" }
-    /// For «через рабочий VPN».
-    var lowercasedName: String { self == .openVPN ? "рабочий VPN" : "личный VPN" }
-    /// For «профиль рабочего VPN».
-    var genitive: String { self == .openVPN ? "рабочего VPN" : "личного VPN" }
-    /// Work and home; the globe already stands for .com sites on «Обзоре».
-    var symbol: String { self == .openVPN ? "building.2" : "house" }
 }
 
 extension OpenVPNRemote {
@@ -100,24 +138,23 @@ extension OpenVPNRemote {
 }
 
 extension ProtectionState {
-    var color: Color {
+    /// The menu bar's «Коммутатор» symbol from Config/Symbols.xcassets.
+    var menuBarSymbol: String {
         switch self {
-        case .protected: .green
-        case .starting: .blue
-        case .degraded: .orange
-        case .error: .red
-        case .off: .gray
+        case .off, .starting: "kommutator.bar.off"
+        case .protected, .degraded: "kommutator.bar.on"
+        case .error: "kommutator.bar.error"
         }
     }
 
-    /// Connected nodes, not a shield: the app switches paths, it is no
-    /// antivirus. Filled nodes say "working" without colour, which the menu
-    /// bar does not have.
-    var symbol: String {
+    /// Off and connecting stay a plain template that follows the menu bar's theme;
+    /// once up, the lever takes the state's colour over a base in the bar's text colour.
+    var leverColor: Color? {
         switch self {
-        case .protected: "point.3.filled.connected.trianglepath.dotted"
-        case .off, .starting, .degraded: "point.3.connected.trianglepath.dotted"
-        case .error: "exclamationmark.triangle"
+        case .off, .starting: nil
+        case .protected: .green
+        case .degraded: .yellow
+        case .error: .red
         }
     }
 }
@@ -144,7 +181,7 @@ extension PingState {
 
     var color: Color {
         switch self {
-        case .milliseconds(let value): value < 150 ? .green : value < 400 ? .orange : .red
+        case .milliseconds(let value): value < 150 ? .green : .secondary
         case .noReply: .secondary
         }
     }
@@ -157,20 +194,16 @@ extension RouterStatus {
         case .off: return "Трафик идёт без VPN"
         case .starting: return "Подключение VPN…"
         case .protected:
-            switch (settings.useOpenVPN, settings.useAmneziaWG) {
-            case (true, false): return "Рабочие сайты — через рабочий VPN, остальное — напрямую"
-            case (false, true): return "Всё, кроме списка «Напрямую», — через личный VPN"
-            default: return "Рабочие сайты — через рабочий VPN, остальное — через личный"
-            }
+            guard let rest = settings.activeDefault, rest.path != .direct else { return "Сайты из направлений — по своим VPN, остальной трафик — напрямую" }
+            return "Сайты из направлений — по своим VPN, остальной трафик — через «\(rest.name)»"
         case .degraded:
-            let down = [(VPNKind.openVPN, openVPN, settings.useOpenVPN), (.amneziaWG, amneziaWG, settings.useAmneziaWG)]
-                .filter { $0.2 && $0.1.phase != .connected }
-            guard !down.isEmpty else { return "VPN подключены не полностью" }
-            let names = down.map { "\($0.0.name): \($0.1.phase.russianTitle.lowercased())" }.joined(separator: ", ")
-            guard settings.killSwitch || !down.contains(where: { $0.0 == .amneziaWG }) else {
-                return names + (down.count == 1 ? " — остальной трафик идёт напрямую" : " — рабочий трафик заблокирован, остальной идёт напрямую")
+            let down = settings.activeDirections.filter { direction in
+                tunnels[direction.id].map { $0.phase != .connected } ?? false
             }
-            return names + (down.count == 1 ? " — его трафик заблокирован" : " — трафик заблокирован")
+            guard !down.isEmpty else { return "VPN подключены не полностью" }
+            return down.map { direction in
+                "«\(direction.name)»: " + (direction.blockWhenDown ? "заблокировано" : "напрямую")
+            }.joined(separator: ", ") + " — пока VPN не подключится"
         case .error:
             return desiredEnabled ? "Не удалось применить правила" : "Маршрутизация выключена из-за ошибки"
         }
@@ -204,57 +237,122 @@ private func countryName(_ code: String) -> String {
     return "\(flag) \(Locale.current.localizedString(forRegionCode: code) ?? code)"
 }
 
-private let linkFormats = "Подходит файл .conf AmneziaWG или WireGuard, ссылка vpn:// из Amnezia («Поделиться VPN»), ссылка vless://, hysteria2://, trojan://, ss://, vmess:// или адрес подписки https://…, как в Happ. Подписка обновляется сама; зашифрованные happ://crypt не поддерживаются."
+private let linkFormats = "Подходит файл .ovpn (OpenVPN), файл .conf AmneziaWG или WireGuard, ссылка vpn:// из Amnezia («Поделиться VPN»), ссылка vless://, hysteria2://, trojan://, ss://, vmess:// или адрес подписки https://…, как в Happ. Подписка обновляется сама; зашифрованные happ://crypt не поддерживаются."
 
 // MARK: - Menu bar
 
+/// Stacks, not a grouped Form: a Form's insets and section gaps are sized for a
+/// settings window and made the menu twice as tall. The spacing is set here by
+/// hand for the same reason, and rows go through MenuRowStyle to line the
+/// switches up in one column.
 private struct MenuContent: View {
     @ObservedObject var model: AppModel
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 10) {
-                StatusBadge(state: model.status.protection, size: 34)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(model.status.protection.russianTitle).font(.headline)
-                    Text(model.status.summary(model.settings))
-                        .font(.caption).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 8)
+            LabeledContent {
                 PowerSwitch(model: model)
+            } label: {
+                Text("Коммутатор").font(.headline)
             }
             .padding(12)
 
-            Divider().padding(.horizontal, 12)
+            notices
 
-            VStack(alignment: .leading, spacing: 10) {
-                TunnelRows(model: model)
-                if model.uses(.amneziaWG), model.settings.exitEngine == .xray, let xray = model.xray, xray.servers.count > 1 {
-                    MenuServerPicker(model: model, xray: xray)
+            Divider()
+            VStack(alignment: .leading, spacing: 8) {
+                header("Направления")
+                ForEach(model.settings.directions) { direction in
+                    DirectionRows.row(model, direction, inWindow: false)
                 }
-                if model.displayedEnabled { SeenAs(model: model) }
+                if model.statusLoaded, model.connections.isEmpty {
+                    Button("Добавить VPN…") {
+                        model.addingConnection = true
+                        show(.profiles)
+                    }
+                }
             }
             .padding(12)
 
-            Banners(model: model, insets: .init(top: 0, leading: 12, bottom: 12, trailing: 12))
-
-            Divider().padding(.horizontal, 12)
-
-            VStack(spacing: 0) {
-                if !model.missingProfiles.isEmpty {
-                    MenuRowButton(title: "Добавить профиль…") { show(.profiles) }
+            // The connection check in brief: which country foreign and Russian
+            // sites see you from. Details are left to the window.
+            Divider()
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    header("Как вас видят сайты")
+                    Spacer()
+                    if model.checking {
+                        ProgressView().controlSize(.small)
+                    } else if let report = model.report {
+                        Text(report.checkedAt.formatted(date: .omitted, time: .shortened))
+                            .font(.caption).foregroundStyle(.secondary)
+                            .help("Время проверки")
+                    }
+                    Button("Проверить", systemImage: "arrow.clockwise", action: model.runChecks)
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(.borderless)
+                        .help("Проверить ещё раз")
+                        .disabled(model.checking)
                 }
-                MenuRowButton(title: "Открыть Коммутатор…") { show(nil) }
-                MenuRowButton(title: "Выйти", detail: model.displayedEnabled ? "VPN выключится" : nil) {
-                    NSApp.terminate(nil)
-                }
+                seenAs("Зарубежные сайты", model.report?.cloudflare)
+                seenAs("Российские сайты", model.report?.yandex)
             }
-            .padding(6)
+            .padding(12)
+
+            Divider()
+            HStack {
+                Button("Открыть Коммутатор…") { show(nil) }
+                Spacer()
+                Button("Выйти") { NSApp.terminate(nil) }
+            }
+            .padding(12)
         }
+        .labeledContentStyle(MenuRowStyle())
         .frame(width: 340)
-        .textSelection(.enabled)
+    }
+
+    private func header(_ title: String) -> some View {
+        Text(title).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+    }
+
+    /// What the window says in alerts and its toolbar, as rows in the menu:
+    /// an alert from the menu bar would open behind other windows.
+    @ViewBuilder
+    private var notices: some View {
+        if let error = model.visibleError {
+            LabeledContent {
+                Button("Скрыть", action: model.dismissError)
+            } label: {
+                Label(error, systemImage: "xmark.octagon.fill").foregroundStyle(.red)
+            }
+            .padding([.horizontal, .bottom], 12)
+        } else if let message = model.systemComponentMessage {
+            VStack(alignment: .leading) {
+                Label(message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                if let fix = model.componentFix {
+                    Button(fix == .install ? "Установить…" : "Открыть настройки", action: model.fixSystemComponent)
+                }
+            }
+            .padding([.horizontal, .bottom], 12)
+        } else if model.update != nil {
+            UpdateControl(model: model)
+                .fixedSize()
+                .padding([.horizontal, .bottom], 12)
+        }
+    }
+
+    private func seenAs(_ title: String, _ result: EchoResult?) -> some View {
+        LabeledContent(title) {
+            if model.report == nil {
+                Text(model.checking ? "…" : "—")
+            } else if let result {
+                Text(result.country.map(countryName) ?? result.ip ?? "ответили")
+                    .textSelection(.enabled)
+            } else {
+                Label("нет ответа", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            }
+        }
     }
 
     private func show(_ page: Page?) {
@@ -264,177 +362,96 @@ private struct MenuContent: View {
     }
 }
 
-/// Another subscription server without opening the window.
-private struct MenuServerPicker: View {
-    @ObservedObject var model: AppModel
-    let xray: XraySummary
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "server.rack").foregroundStyle(.secondary).frame(width: 22)
-            ServerPicker(model: model, xray: xray)
+/// LabeledContent outside a Form hugs its label, so each row's switch stood
+/// wherever its text ended. This pushes the content to the trailing edge.
+private struct MenuRowStyle: LabeledContentStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            VStack(alignment: .leading, spacing: 2) { configuration.label }
+            Spacer(minLength: 8)
+            configuration.content
         }
-        .task { model.pingServersIfNeeded() }
-    }
-}
-
-/// The subscription's servers with their ping, as a pop-up: a list of rows
-/// under the profile read as a third VPN.
-private struct ServerPicker: View {
-    @ObservedObject var model: AppModel
-    let xray: XraySummary
-
-    var body: some View {
-        // A closure, not `set: model.selectServer`: that method reference
-        // crashes the Swift 6 compiler in IRGen.
-        Picker("Сервер", selection: Binding(get: { xray.selected }, set: { model.selectServer($0) })) {
-            ForEach(Array(xray.servers.enumerated()), id: \.offset) { index, server in
-                Text(model.ping(of: server).map { "\(server.name) · \($0.text)" } ?? server.name).tag(index)
-            }
-        }
-        .labelsHidden()
-        .disabled(model.updatingXray)
-    }
-}
-
-/// The connection check in brief: where .com and .ru sites see you from.
-/// The work network is left to the window; here it would crowd the menu.
-private struct SeenAs: View {
-    @ObservedObject var model: AppModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("Проверка подключения").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                if model.checking { ProgressView().controlSize(.mini) }
-                Button { model.runChecks() } label: { Image(systemName: "arrow.clockwise") }
-                    .buttonStyle(.borderless)
-                    .disabled(model.checking)
-                    .help("Проверить ещё раз")
-                    .accessibilityLabel("Проверить ещё раз")
-            }
-            row(symbol: "globe", title: "Сайты .com", result: model.report?.com)
-            row(symbol: "flag", title: "Сайты .ru", result: model.report?.ru)
-        }
-    }
-
-    private func row(symbol: String, title: String, result: EchoResult?) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: symbol).foregroundStyle(.secondary).frame(width: 22)
-            Text(title)
-            Spacer()
-            if model.report != nil {
-                if let result {
-                    Text(result.country.map(countryName) ?? result.ip ?? "ответили").foregroundStyle(.secondary)
-                } else {
-                    Label("нет ответа", systemImage: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                }
-            } else {
-                Text(model.checking ? "…" : "—").foregroundStyle(.secondary)
-            }
-        }
-        .font(.callout)
-    }
-}
-
-/// A full-width row with the hover highlight of a native menu item.
-private struct MenuRowButton: View {
-    let title: String
-    var detail: String?
-    let action: () -> Void
-    @State private var hovering = false
-
-    var body: some View {
-        Button(action: action) {
-            HStack {
-                Text(title)
-                Spacer()
-                if let detail { Text(detail).foregroundStyle(.secondary) }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(hovering ? Color.primary.opacity(0.1) : .clear, in: RoundedRectangle(cornerRadius: 5))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering = $0 }
     }
 }
 
 // MARK: - Main window
 
 enum Page: String, CaseIterable, Identifiable {
-    case overview, profiles, rules, general, diagnostics
+    case overview, rules, profiles, general, diagnostics
     var id: Self { self }
 
     var title: String {
         switch self {
         case .overview: "Обзор"
-        case .profiles: "Профили"
+        case .profiles: "VPN"
         case .rules: "Маршруты"
         case .general: "Общие"
         case .diagnostics: "Диагностика"
         }
     }
 
-    var symbol: String {
+    var icon: Image {
         switch self {
-        case .overview: "point.3.filled.connected.trianglepath.dotted"
-        case .profiles: "key"
-        case .rules: "arrow.triangle.branch"
-        case .general: "gearshape"
-        case .diagnostics: "stethoscope"
+        case .overview: Image("kommutator.off")
+        case .profiles: Image(systemName: "key")
+        case .rules: Image(systemName: "arrow.triangle.branch")
+        case .general: Image(systemName: "gearshape")
+        case .diagnostics: Image(systemName: "stethoscope")
         }
     }
 }
 
 private struct MainWindow: View {
     @ObservedObject var model: AppModel
+    /// Asked once per message: some only inform, such as an update waiting for a reboot.
+    @State private var dismissedComponent: String?
 
     var body: some View {
+        GeometryReader { viewport in
+            navigation
+                .frame(width: viewport.size.width, height: viewport.size.height)
+        }
+        .frame(minWidth: 740, minHeight: 520)
+        .alert(item: $model.pendingUnsafe) { pending in
+            Alert(
+                title: Text("Доверенный системный профиль?"),
+                message: Text("Эти строки смогут запускать код с правами root:\n\n\(pending.directives.joined(separator: "\n"))"),
+                primaryButton: .destructive(Text("Разрешить"), action: model.confirmUnsafeImport),
+                secondaryButton: .cancel(model.cancelUnsafeImport)
+            )
+        }
+    }
+
+    private var navigation: some View {
         NavigationSplitView {
             List(Page.allCases, selection: $model.page) { page in
-                HStack {
-                    Label(page.title, systemImage: page.symbol)
-                    Spacer()
-                    // What the page is waiting on, before you open it.
-                    if let hint = attention(page) {
-                        Circle().fill(.orange).frame(width: 7, height: 7)
-                            .help(hint)
-                            .accessibilityLabel(hint)
-                    }
+                Label {
+                    Text(verbatim: page.title)
+                } icon: {
+                    page.icon
                 }
+                .labelStyle(.titleAndIcon)
+                .tag(page)
             }
+            .listStyle(.sidebar)
             .navigationSplitViewColumnWidth(min: 190, ideal: 200, max: 250)
-            // The one control every page needs, named, and where the state is
-            // already shown: a bare switch in the toolbar read as anything but VPN.
-            .safeAreaInset(edge: .bottom) {
-                HStack(spacing: 10) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("VPN").font(.headline)
-                        HStack(spacing: 5) {
-                            Circle().fill(model.status.protection.color).frame(width: 7, height: 7)
-                            // One line: with the spinner beside the switch, a
-                            // longer state wrapped and the block jumped in height.
-                            Text(model.status.protection.russianTitle)
-                                .lineLimit(1)
-                                .help(model.status.protection.russianTitle)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                VStack(spacing: 0) {
+                    Divider()
+                    HStack {
+                        VStack(alignment: .leading) {
+                            Text("VPN")
+                            Text(model.status.protection.russianTitle).font(.caption).foregroundStyle(.secondary)
                         }
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        Spacer()
+                        PowerSwitch(model: model)
                     }
-                    Spacer()
-                    PowerSwitch(model: model)
+                    .padding()
                 }
-                .padding(12)
-                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .padding(10)
+                .background(.bar)
             }
         } detail: {
             VStack(spacing: 0) {
-                Banners(model: model)
                 switch model.page ?? .overview {
                 case .overview: OverviewPage(model: model)
                 case .profiles: ProfilesPage(model: model)
@@ -448,74 +465,109 @@ private struct MainWindow: View {
             .textSelection(.enabled)
             // The page, not the app name: the title says where you are.
             .navigationTitle((model.page ?? .overview).title)
+            .toolbar {
+                if model.update != nil {
+                    ToolbarItem(placement: .automatic) { UpdateControl(model: model) }
+                }
+            }
         }
-        .frame(minWidth: 740, minHeight: 520)
-        .alert(item: $model.pendingUnsafe) { pending in
-            Alert(
-                title: Text("Доверенный системный профиль?"),
-                message: Text("Эти строки смогут запускать код с правами root:\n\n\(pending.directives.joined(separator: "\n"))"),
-                primaryButton: .destructive(Text("Разрешить"), action: model.confirmUnsafeImport),
-                secondaryButton: .cancel(model.cancelUnsafeImport)
-            )
+        // A failure the page has no better place for; a connection's own
+        // failure shows next to it instead (see visibleError).
+        .alert("Ошибка", isPresented: Binding(
+            get: { model.visibleError != nil },
+            set: { if !$0 { model.dismissError() } }
+        )) {
+            Button("OK") { model.dismissError() }
+        } message: {
+            Text(model.visibleError ?? "")
         }
-    }
-
-    private func attention(_ page: Page) -> String? {
-        switch page {
-        case .profiles: model.missingProfiles.isEmpty ? nil : "Не хватает профиля"
-        case .rules: model.rulesChanged ? "Есть неприменённые изменения" : nil
-        default: nil
+        .alert("Системный компонент", isPresented: Binding(
+            get: { model.systemComponentMessage.map { $0 != dismissedComponent } ?? false },
+            set: { if !$0 { dismissedComponent = model.systemComponentMessage } }
+        )) {
+            if let fix = model.componentFix {
+                Button(fix == .install ? "Установить…" : "Открыть настройки") { model.fixSystemComponent() }
+            }
+            Button(model.componentFix == nil ? "OK" : "Позже", role: .cancel) {}
+        } message: {
+            Text(model.systemComponentMessage ?? "")
         }
     }
 }
 
 private struct OverviewPage: View {
     @ObservedObject var model: AppModel
+    @State private var checkHost = ""
 
     var body: some View {
-        Form {
-            // No big status block: the state is already by the switch in the
-            // sidebar, and what it means for traffic fits under the VPNs.
-            Section {
-                TunnelRows(model: model, inWindow: true)
-            } header: {
-                Text("VPN")
-            } footer: {
-                Note(model.status.summary(model.settings))
-            }
-            Section {
-                if let report = model.report {
-                    CheckRow(symbol: "globe", title: "Сайты .com", result: echo(report.com, url: NetworkProbes.comCheck))
-                    CheckRow(symbol: "flag", title: "Сайты .ru", result: echo(report.ru, url: NetworkProbes.ruCheck))
-                    if model.settings.useOpenVPN {
-                        CheckRow(symbol: VPNKind.openVPN.symbol, title: "Рабочая сеть", result: corporate(report.corporate))
-                    }
-                } else {
-                    Text(model.checking ? "Проверка…" :"Проверка запустится сама, когда VPN подключится.")
-                        .foregroundStyle(.secondary)
+        if model.statusLoaded, model.connections.isEmpty {
+            ContentUnavailableView {
+                Label("Сначала добавьте VPN", systemImage: "key")
+            } description: {
+                Text("Файл .ovpn или .conf, ссылка или подписка — на странице «VPN».")
+            } actions: {
+                Button("Добавить VPN…") {
+                    model.page = .profiles
+                    model.addingConnection = true
                 }
-            } header: {
-                HStack {
-                    Text("Проверка подключения")
-                    if let report = model.report, !model.checking {
-                        Text("· проверено в \(report.checkedAt.formatted(date: .omitted, time: .shortened))")
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    if model.checking { ProgressView().controlSize(.small) }
-                    Button("Проверить", action: model.runChecks)
-                        .keyboardShortcut("r")
-                        .disabled(model.checking)
-                }
-            } footer: {
-                Note("Сайты .com и .ru отвечают, с каким адресом вас видят. Страна, город и провайдер определяются по этому адресу через ipinfo.io. Рабочая сеть проверяется пингом до DNS компании через рабочий VPN.")
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            Form {
+                // No big status block: the state is already by the switch in the
+                // sidebar, and what it means for traffic fits under the routes.
+                Section {
+                    ForEach(model.settings.directions) { direction in
+                        DirectionRows.row(model, direction, inWindow: true)
+                    }
+                } header: {
+                    Text("Направления")
+                } footer: {
+                    Note(model.status.summary(model.settings))
+                }
+                Section {
+                    CheckRow(title: "Зарубежные сайты", result: echo(model.report?.cloudflare, url: NetworkProbes.cloudflareCheck))
+                    CheckRow(title: "Российские сайты", result: echo(model.report?.yandex, url: NetworkProbes.yandexCheck))
+                    HStack {
+                        TextField("Сайт или IP", text: $checkHost, prompt: Text("site.org"))
+                            .labelsHidden()
+                            .onSubmit { model.checkRoute(checkHost) }
+                        Button("Проверить сайт") { model.checkRoute(checkHost) }
+                            .disabled(checkHost.trimmingCharacters(in: .whitespaces).isEmpty || model.checkingRoute)
+                        if model.checkingRoute { ProgressView().controlSize(.small) }
+                    }
+                    if let check = model.routeCheck {
+                        RouteCheckRow(check: check, via: model.via(check.interface))
+                        HStack {
+                            Spacer()
+                            AddRuleMenu(model: model, host: check.host)
+                        }
+                        .controlSize(.small)
+                    }
+                } header: {
+                    HStack {
+                        Text("Проверка подключения")
+                        if let report = model.report, !model.checking {
+                            Text("· проверено в \(report.checkedAt.formatted(date: .omitted, time: .shortened))")
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if model.checking { ProgressView().controlSize(.small) }
+                        Button("Проверить", action: model.runChecks)
+                            .keyboardShortcut("r")
+                            .disabled(model.checking)
+                    }
+                } footer: {
+                    Note("cloudflare.com и yandex.ru отвечают, с каким адресом вас видят, — так же, как их видит браузер, с VPN и без. Страна, город и провайдер определяются по этому адресу через ipinfo.io. «Проверить сайт» открывает настоящее соединение и показывает, через что оно прошло, по применённым правилам. Какие соединения идут через что прямо сейчас — в «Диагностике», вкладка «Трафик».")
+                }
+            }
+            .formStyle(.grouped)
         }
-        .formStyle(.grouped)
     }
 
     private func echo(_ result: EchoResult?, url: URL) -> CheckResult {
         var rows = [("Запрос", (url.host() ?? "") + url.path())]
+        guard model.report != nil else { return .init(ok: false, rows: rows + [("Ответ", model.checking ? "проверка…" : "ещё не проверялось")]) }
         guard let result else { return .init(ok: false, rows: rows + [("Ответ", "не пришёл за 8 секунд")]) }
         if let ip = result.ip { rows.append(("Видят адрес", ip)) }
         if let place = place(result) { rows.append(("Откуда", place)) }
@@ -523,21 +575,6 @@ private struct OverviewPage: View {
         rows.append(("Маршрут", model.via(result.interface)))
         rows.append(("Время", "\(result.milliseconds) мс"))
         return .init(ok: true, rows: rows)
-    }
-
-    private func corporate(_ ping: PingState?) -> CheckResult {
-        var rows: [(String, String)] = []
-        if let target = model.status.openVPN.probeAddress { rows.append(("Запрос", "ping \(target) — DNS компании")) }
-        switch ping {
-        case .milliseconds?:
-            rows.append(("Маршрут", model.via(model.status.openVPN.interfaceName)))
-            rows.append(("Время", ping?.text ?? ""))
-            return .init(ok: true, rows: rows)
-        case .noReply?:
-            return .init(ok: false, rows: rows + [("Ответ", "DNS компании не ответил через рабочий VPN")])
-        case nil:
-            return .init(ok: false, rows: rows + [("Ответ", "рабочий VPN не подключён или сервер не прислал свой DNS")])
-        }
     }
 }
 
@@ -547,14 +584,12 @@ private struct CheckResult {
 }
 
 private struct CheckRow: View {
-    let symbol: String
     let title: String
     let result: CheckResult
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 10) {
-                Image(systemName: symbol).foregroundStyle(.secondary).frame(width: 22)
                 Text(title)
                 Spacer()
                 Image(systemName: result.ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
@@ -569,115 +604,215 @@ private struct CheckRow: View {
                 }
             }
             .font(.caption)
-            .padding(.leading, 32)
         }
     }
 }
 
+/// Every saved VPN, each with what belongs to it alone: its login, its first
+/// server, its subscription. Which sites go through it is «Маршруты»' business.
 private struct ProfilesPage: View {
     @ObservedObject var model: AppModel
-    @State private var dropTargeted = false
     @State private var editing: EditedProfile?
+    @State private var dropping = false
+    @State private var dropError: String?
 
     var body: some View {
-        Form {
-            Section {
-                LabeledContent("Профиль") {
-                    HStack {
-                        if model.hasOpenVPN {
-                            Text(model.status.profiles.openVPNServer ?? "Сохранён")
-                                .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-                            Button("Изменить…") { edit(.openVPN) }
-                            Button("Заменить…") { model.importFile(.openVPN) }
-                        } else {
-                            Text("Не добавлен").foregroundStyle(.secondary)
-                            Button("Добавить .ovpn…") { model.importFile(.openVPN) }
-                        }
+        Group {
+            if model.statusLoaded, model.connections.isEmpty {
+                ContentUnavailableView {
+                    Label("VPN не добавлены", systemImage: "key")
+                } description: {
+                    Text("Файлы .ovpn и .conf можно просто перетащить в это окно.")
+                } actions: {
+                    Button("Добавить VPN…") { model.addingConnection = true }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                Form {
+                    ForEach(model.connections) { item in
+                        ConnectionSection(model: model, item: item, onEdit: edit)
+                    }
+                    if let dropError {
+                        Section { Label(dropError, systemImage: "xmark.octagon.fill").foregroundStyle(.red) }
                     }
                 }
-                if model.hasOpenVPN {
-                    if let remotes = model.status.profiles.openVPNRemotes, remotes.count > 1 {
-                        Picker("Сначала подключаться к", selection: Binding(
-                            get: { model.settings.preferredOpenVPNRemote.flatMap { remotes.contains($0) ? $0 : nil } ?? remotes[0] },
-                            set: { model.preferRemote($0) }
-                        )) {
-                            ForEach(remotes, id: \.self) { remote in Text(remote.title).tag(remote) }
-                        }
-                    }
-                    if model.openVPNNeedsLogin {
-                        TextField("Логин", text: $model.openVPNUsername)
-                            .onSubmit(model.saveCredentials)
-                    }
-                    // The button sits on the password's own row: under the whole
-                    // section it read as if the profile needed saving too.
-                    LabeledContent("Пароль") {
-                        HStack {
-                            SecureField("Пароль", text: $model.openVPNPassword, prompt: Text(model.openVPNHasPassword ? "Сохранён" : "Не задан"))
-                                .labelsHidden()
-                                .onSubmit(model.saveCredentials)
-                            Button("Сохранить", action: model.saveCredentials)
-                                .disabled(!model.credentialsChanged)
-                        }
-                    }
-                }
-            } header: {
-                ProfileHeader(model: model, kind: .openVPN)
-            } footer: {
-                if (model.status.profiles.openVPNRemotes?.count ?? 0) > 1 {
-                    Note("Если выбранный сервер не ответит, рабочий VPN попробует остальные по порядку из профиля.")
-                }
-            }
-            Section {
-                ExitProfileRow(model: model) { edit(.amneziaWG) }
-                if model.settings.exitEngine == .xray, let xray = model.xray {
-                    LabeledContent("Сервер") {
-                        HStack {
-                            ServerPicker(model: model, xray: xray).fixedSize()
-                            if model.pingingServers { ProgressView().controlSize(.small) }
-                            Button("Проверить пинг", action: model.pingServers)
-                                .disabled(model.pingingServers)
-                            Button("Самый быстрый") {
-                                if let fastest = model.fastestServer { model.selectServer(fastest) }
-                            }
-                            .disabled(model.fastestServer == nil || model.fastestServer == xray.selected || model.updatingXray)
-                        }
-                    }
-                    .onAppear(perform: model.pingServersIfNeeded)
-                    if xray.fromSubscription {
-                        SubscriptionRows(model: model, xray: xray)
-                        DisclosureGroup("Дополнительно") { UserAgentRow(model: model, xray: xray) }
-                    }
-                }
-            } header: {
-                ProfileHeader(model: model, kind: .amneziaWG)
-            } footer: {
-                Note("Через него идёт всё, чего нет в списках «Маршрутов»."
-                    + (model.settings.exitEngine == .xray && model.xray != nil
-                        ? " Пинг идёт напрямую, без VPN: он показывает, что сервер доступен, но не проверяет сам прокси."
-                        : ""))
+                .formStyle(.grouped)
             }
         }
-        .formStyle(.grouped)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                HStack {
+                    if dropping { ProgressView().controlSize(.small) }
+                    Button { model.addingConnection = true } label: { Label("Добавить VPN", systemImage: "plus") }
+                        .help("Добавить VPN: файл .ovpn или .conf, ссылку или подписку")
+                }
+            }
+        }
         .sheet(item: $editing) { ProfileEditor(model: model, file: $0) }
-        .sheet(isPresented: $model.addingExit) { AddExitSheet(model: model) }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            EdgeBar {
-                Label("Файлы .ovpn и .conf можно перетащить в это окно", systemImage: "arrow.down.doc")
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .dropDestination(for: URL.self) { urls, _ in
-            model.importDropped(urls)
-        } isTargeted: { dropTargeted = $0 }
-        .overlay {
-            if dropTargeted {
-                RoundedRectangle(cornerRadius: 10).strokeBorder(Color.accentColor, lineWidth: 3).padding(6)
+        .sheet(isPresented: $model.addingConnection) { AddConnectionSheet(model: model) }
+        .dropDestination(for: URL.self) { urls, _ in importDropped(urls) }
+    }
+
+    private func edit(_ item: ConnectionSummary) {
+        guard item.kind != .xray else { return }
+        Task {
+            if let text = await model.profileText(item.id) {
+                editing = .init(kind: item.kind == .openVPN ? .openVPN : .amneziaWG, text: text, connection: item.id)
             }
         }
     }
 
-    private func edit(_ kind: VPNKind) {
-        Task { if let text = await model.profileText(kind) { editing = .init(kind: kind, text: text) } }
+    private func importDropped(_ urls: [URL]) -> Bool {
+        let accepted = urls.filter { AppModel.kind(of: $0) != nil }
+        guard !accepted.isEmpty, !dropping else { return false }
+        Task {
+            dropping = true
+            defer { dropping = false }
+            dropError = nil
+            for url in accepted {
+                if let message = await model.addProfile(at: url) {
+                    dropError = message
+                    return
+                }
+            }
+        }
+        return true
+    }
+}
+
+private struct ConnectionSection: View {
+    @ObservedObject var model: AppModel
+    let item: ConnectionSummary
+    let onEdit: (ConnectionSummary) -> Void
+
+    private var busy: Bool { model.busyConnection == item.id }
+    private var users: [Direction] { model.settings.directions.filter { $0.connection == item.id } }
+
+    var body: some View {
+        Section {
+            LabeledContent("Протокол", value: item.protocolTitle ?? item.kind.title)
+            LabeledContent("Направления") {
+                Text(users.isEmpty ? "не используется" : users.map { "«\($0.name)»" }.joined(separator: ", "))
+                    .foregroundStyle(.secondary)
+            }
+            switch item.kind {
+            case .openVPN: openVPNRows
+            case .amneziaWG:
+                hostPingRows(item.title)
+            case .xray:
+                if let xray = item.xray { xrayRows(xray) }
+            }
+            if let error = model.connectionErrors[item.id] {
+                Label(error, systemImage: "xmark.octagon.fill").foregroundStyle(.red)
+            }
+            // In sight, not behind a menu: editing and removing a VPN were not
+            // found there. Last row, as «Забыть эту сеть…» in System Settings.
+            HStack {
+                Spacer()
+                if item.kind != .xray { Button("Изменить профиль…") { onEdit(item) } }
+                Button("Удалить VPN…", role: .destructive) { model.deleteConnection(item) }
+            }
+            .disabled(busy)
+        } header: {
+            HStack {
+                Text(item.title).lineLimit(1).truncationMode(.middle)
+                Spacer()
+                DelayedProgressView(active: busy)
+            }
+        }
+    }
+
+    /// A server of its own, not a subscription's list: ICMP to it, or with the
+    /// VPN up, through the tunnel to 1.1.1.1, which answers.
+    @ViewBuilder
+    private func hostPingRows(_ host: String) -> some View {
+        PingRow(ping: model.ping(host: host), checking: model.pinging.contains(host)) {
+            model.pingHost(host, through: model.connectedInterface(of: item.id))
+        }
+        Note(model.connectedInterface(of: item.id).map { "Через туннель \($0) до 1.1.1.1: задержка до сервера и дальше, как её видит ваш трафик." }
+            ?? "ICMP до сервера. Многие серверы и хостинги не отвечают на ping, хотя VPN через них работает: тогда здесь будет «нет ответа». Когда VPN подключён, ping идёт через туннель — это точнее.")
+    }
+
+    @ViewBuilder
+    private var openVPNRows: some View {
+        if let remotes = item.remotes, remotes.count > 1 {
+            Picker("Сначала подключаться к", selection: Binding(
+                get: { item.preferredRemote.flatMap { remotes.contains($0) ? $0 : nil } ?? remotes[0] },
+                set: { model.preferRemote($0, for: item.id) }
+            )) {
+                ForEach(remotes, id: \.self) { remote in Text(remote.title).tag(remote) }
+            }
+            .disabled(busy)
+            Note("Если выбранный сервер не ответит, OpenVPN попробует остальные по порядку из профиля.")
+        }
+        // The server it tries first, as the route editor pings it.
+        if let host = (item.preferredRemote ?? item.remotes?.first)?.host { hostPingRows(host) }
+        if item.needsLogin {
+            LabeledContent("Логин") {
+                TextField("Логин", text: Binding(
+                    get: { model.usernames[item.id] ?? item.username ?? "" },
+                    set: { model.usernames[item.id] = $0 }
+                ))
+                .labelsHidden()
+                .onSubmit { model.saveCredentials(item.id) }
+            }
+        }
+        LabeledContent("Пароль") {
+            HStack {
+                SecureField("Пароль", text: Binding(
+                    get: { model.passwords[item.id] ?? "" },
+                    set: { model.passwords[item.id] = $0 }
+                ), prompt: Text(item.hasPassword ? "Сохранён" : "Не задан"))
+                .labelsHidden()
+                .onSubmit { model.saveCredentials(item.id) }
+                .disabled(busy)
+                Button("Сохранить") { model.saveCredentials(item.id) }
+                    .disabled(!model.credentialsChanged(item.id) || busy)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func xrayRows(_ xray: XraySummary) -> some View {
+        if xray.fromSubscription {
+            LabeledContent("Подписка") {
+                HStack {
+                    CompactSubscriptionStatus(xray: xray, status: SubscriptionAnnouncement(xray.announce).status)
+                    Spacer()
+                    Menu {
+                        Button("Обновить") { model.updateXray(.init(connection: item.id, refresh: true)) }
+                        if let url = xray.supportURL { Link("Поддержка", destination: url) }
+                        if let url = xray.webPageURL { Link("Сайт", destination: url) }
+                        if let updated = xray.updatedAt {
+                            Text("Обновлена \(updated.formatted(Calendar.current.isDateInToday(updated) ? .dateTime.hour().minute() : .dateTime.day().month().hour().minute()))")
+                        }
+                    } label: {
+                        Text("Подписка")
+                    }
+                    .fixedSize()
+                    .disabled(busy)
+                }
+            }
+            if let details = SubscriptionAnnouncement(xray.announce).details { Note(details) }
+            if let warning = xray.warning {
+                Label(warning, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            }
+        }
+        HStack {
+            Text(xray.servers.count == 1 ? "Сервер" : "Серверы: \(xray.servers.count)")
+            Spacer()
+            if model.pingingServers == item.id {
+                Text("Проверено \(model.pingedServerCount) из \(model.pingableServerCount)").foregroundStyle(.secondary)
+            }
+            Button("Проверить ping") { model.pingServers(item.id) }
+                .disabled(model.pingingServers != nil)
+        }
+        // Ids unique across the page: the Form is one table, and two
+        // subscriptions both numbering their rows from 0 broke its layout.
+        ForEach(xray.servers.indices.map { (id: "\(item.id)#\($0)", server: xray.servers[$0]) }, id: \.id) { row in
+            LabeledContent(row.server.name, value: row.server.protocolTitle + " · " + (model.ping(of: row.server)?.text ?? "—"))
+                .help(row.server.endpoint ?? "Адрес не указан")
+        }
     }
 }
 
@@ -685,6 +820,7 @@ private struct EditedProfile: Identifiable {
     let id = UUID()
     let kind: VPNKind
     let text: String
+    let connection: UUID
 }
 
 /// The stored profile as text. The file it once came from is not involved.
@@ -693,6 +829,7 @@ private struct ProfileEditor: View {
     let file: EditedProfile
     @State private var text: String
     @State private var failure: String?
+    @State private var saving = false
     @Environment(\.dismiss) private var dismiss
 
     init(model: AppModel, file: EditedProfile) {
@@ -702,30 +839,41 @@ private struct ProfileEditor: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("Профиль \(file.kind.genitive)").font(.headline)
-                Spacer()
-            }
-            .padding(12)
-            Divider()
-            PlainTextEditor(text: $text)
-            EdgeBar {
+        NavigationStack {
+            VStack(spacing: 0) {
+                PlainTextEditor(text: $text)
                 if let failure {
-                    Label(failure, systemImage: "xmark.octagon.fill").foregroundStyle(.red).lineLimit(2)
-                } else {
-                    Text("Сохранится в Коммутаторе и сразу применится").foregroundStyle(.secondary)
+                    Divider()
+                    Label(failure, systemImage: "xmark.octagon.fill")
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding()
                 }
-                Spacer()
-                Button("Отмена") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-                Button("Сохранить и применить") {
-                    failure = model.saveProfile(text, as: file.kind)
-                    if failure == nil { dismiss() }
+            }
+            .navigationTitle("Профиль \(file.kind.title)")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Отмена") { dismiss() }
+                        .keyboardShortcut(.cancelAction)
+                        .disabled(saving)
                 }
-                .keyboardShortcut("s")
-                .buttonStyle(.borderedProminent)
-                .disabled(text == file.text)
+                ToolbarItem(placement: .confirmationAction) {
+                    HStack {
+                        if saving { ProgressView().controlSize(.small) }
+                        Button("Сохранить и применить") {
+                            guard !saving else { return }
+                            saving = true
+                            Task {
+                                failure = await model.saveProfile(text, as: file.kind, connection: file.connection)
+                                saving = false
+                                if failure == nil { dismiss() }
+                            }
+                        }
+                        .keyboardShortcut("s")
+                        .disabled(text == file.text || saving)
+                    }
+                }
             }
         }
         .frame(minWidth: 640, minHeight: 480)
@@ -771,325 +919,581 @@ private struct PlainTextEditor: NSViewRepresentable {
     }
 }
 
-/// Choosing and managing apart, as the HIG has it: radio buttons pick the
-/// profile in one click with all of them in sight; deleting, rare and
-/// destructive, sits in its own menu and never touches the one in use.
-private struct ExitProfileRow: View {
-    @ObservedObject var model: AppModel
-    let onEdit: () -> Void
-
-    private var inUse: ExitItem? {
-        model.exits.first { $0.spare == nil && $0.engine == model.settings.exitEngine }
-    }
-
-    var body: some View {
-        if model.exits.isEmpty {
-            LabeledContent("Профиль") {
-                HStack {
-                    Text("Не добавлен").foregroundStyle(.secondary)
-                    Button("Добавить…") { model.addingExit = true }
-                }
-            }
-        } else {
-            Picker("Профиль", selection: Binding<String?>(
-                get: { inUse?.id },
-                set: { id in if let item = model.exits.first(where: { $0.id == id }) { model.selectExit(item) } }
-            )) {
-                ForEach(model.exits) { item in Text(item.title).tag(Optional(item.id)) }
-            }
-            .pickerStyle(.radioGroup)
-            LabeledContent {
-                HStack {
-                    Button("Добавить…") { model.addingExit = true }
-                    if inUse?.engine == .amneziaWG { Button("Изменить…", action: onEdit) }
-                    Menu("Удалить") {
-                        ForEach(model.exits.filter { $0 != inUse }) { item in
-                            Button(item.title + "…") { model.deleteExit(item) }
-                        }
-                    }
-                    .fixedSize()
-                    .disabled(model.exits.count < 2)
-                    .help(model.exits.count < 2 ? "Используемый профиль удалить нельзя" : "")
-                }
-            } label: { EmptyView() }
-        }
-    }
-}
-
-/// Whether a VPN is used sits by its profile: a footnote sending people to
-/// «Обзор» for it read as a chore.
-private struct ProfileHeader: View {
-    @ObservedObject var model: AppModel
-    let kind: VPNKind
-
-    var body: some View {
-        let inUse = model.uses(kind)
-        let canTurnOff = model.uses(kind == .openVPN ? .amneziaWG : .openVPN)
-        HStack {
-            Text(kind.name)
-            Spacer()
-            Toggle("Использовать", isOn: Binding(get: { inUse }, set: { model.setTunnel(kind, inUse: $0) }))
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                .disabled(inUse && !canTurnOff)
-                .help(inUse && !canTurnOff ? "Хотя бы один VPN должен оставаться включённым" : "")
-        }
-    }
-}
-
-/// Every way to give the personal VPN a profile, in one place. The kind is
-/// read from what was given. A failed link stays in the field, so a mistyped
-/// address can be fixed rather than retyped.
-private struct AddExitSheet: View {
+/// Every way to add a VPN, in one place. The kind is read from what was
+/// given. A failed link stays in the field, so a mistyped address can be fixed
+/// rather than retyped.
+private struct AddConnectionSheet: View {
     @ObservedObject var model: AppModel
     @State private var source = ""
     @State private var dropTargeted = false
+    @State private var failure: String?
+    @State private var saving = false
+    /// The OpenVPN just added asks for a login: the sheet asks for it next.
+    @State private var credentialsFor: UUID?
     @Environment(\.dismiss) private var dismiss
 
     private var trimmed: String { source.trimmingCharacters(in: .whitespacesAndNewlines) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Профиль личного VPN").font(.headline)
-            VStack(spacing: 8) {
-                Image(systemName: "arrow.down.doc").font(.largeTitle).foregroundStyle(.secondary)
-                Text("Перетащите сюда файл .conf").foregroundStyle(.secondary)
-                Button("Выбрать файл…") {
-                    if model.importFile(.amneziaWG), model.errorMessage == nil { dismiss() }
-                }
-            }
-            .frame(maxWidth: .infinity)
-            .padding(18)
-            .background {
-                RoundedRectangle(cornerRadius: 10)
-                    .strokeBorder(dropTargeted ? Color.accentColor : Color.secondary.opacity(0.4),
-                                  style: StrokeStyle(lineWidth: dropTargeted ? 3 : 1, dash: dropTargeted ? [] : [5]))
-            }
-            .dropDestination(for: URL.self) { urls, _ in
-                let accepted = model.importDropped(urls)
-                if accepted { dismiss() }
-                return accepted
-            } isTargeted: { dropTargeted = $0 }
-            TextField("Или вставьте ссылку", text: $source, prompt: Text("vpn://…, vless://… или https://… подписки"))
-                .onSubmit(add)
-            Note(linkFormats)
-            if let error = model.errorMessage {
-                Label(error, systemImage: "xmark.octagon.fill").foregroundStyle(.red).font(.callout)
-            }
-            HStack {
-                if model.updatingXray { ProgressView().controlSize(.small) }
-                Spacer()
-                Button("Отмена") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-                Button("Добавить", action: add)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(trimmed.isEmpty || model.updatingXray)
+        NavigationStack {
+            if let id = credentialsFor {
+                CredentialsStep(model: model, id: id) { dismiss() }
+            } else {
+                addForm
             }
         }
-        .padding(20)
         .frame(width: 500)
-        // An old error from the window would read as this sheet's.
-        .onAppear { model.errorMessage = nil }
+        .frame(minHeight: 360)
+        // A slot picked on «Маршруты» is for this one VPN only.
+        .onDisappear { model.adoptSlot = nil }
+    }
+
+    private var addForm: some View {
+            Form {
+                Section {
+                    GroupBox {
+                        VStack(spacing: 8) {
+                            Image(systemName: dropTargeted ? "arrow.down.doc.fill" : "arrow.down.doc")
+                                .font(.largeTitle)
+                                .foregroundStyle(dropTargeted ? Color.accentColor : Color.secondary)
+                            Text(dropTargeted ? "Отпустите файл" : "Перетащите сюда файл .ovpn или .conf")
+                                .foregroundStyle(dropTargeted ? Color.accentColor : Color.secondary)
+                            Button("Выбрать файл…", action: chooseFile)
+                                .disabled(saving)
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .dropDestination(for: URL.self) { urls, _ in
+                        importDropped(urls)
+                    } isTargeted: { dropTargeted = $0 }
+                }
+                Section {
+                    TextField("Ссылка", text: $source, prompt: Text("Ссылка из Amnezia или Happ"))
+                        .onSubmit(add)
+                        .disabled(saving)
+                    DisclosureGroup("Что подходит") { Note(linkFormats) }
+                }
+                if let failure {
+                    Section {
+                        Label(failure, systemImage: "xmark.octagon.fill")
+                            .foregroundStyle(.red)
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            .navigationTitle("Новый VPN")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Отмена") { dismiss() }
+                        .keyboardShortcut(.cancelAction)
+                        .disabled(saving)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    HStack {
+                        if saving { ProgressView().controlSize(.small) }
+                        Button("Добавить", action: add)
+                            .keyboardShortcut(.defaultAction)
+                            .disabled(trimmed.isEmpty || saving)
+                    }
+                }
+            }
     }
 
     private func add() {
-        guard !trimmed.isEmpty, !model.updatingXray else { return }
-        Task { if await model.addExit(trimmed) { dismiss() } }
+        guard !trimmed.isEmpty, !saving else { return }
+        save { await model.addLink(trimmed) }
+    }
+
+    private func chooseFile() {
+        guard let url = model.chooseProfileFile(nil) else { return }
+        save { await model.addProfile(at: url) }
+    }
+
+    private func importDropped(_ urls: [URL]) -> Bool {
+        guard let url = urls.first(where: { AppModel.kind(of: $0) != nil }), !saving else { return false }
+        save { await model.addProfile(at: url) }
+        return true
+    }
+
+    private func save(_ operation: @escaping @MainActor () async -> String?) {
+        saving = true
+        failure = nil
+        Task {
+            failure = await operation()
+            saving = false
+            guard failure == nil else { return }
+            if let id = model.lastAdded, model.needsCredentials(id) { credentialsFor = id } else { dismiss() }
+        }
     }
 }
 
-private struct SubscriptionRows: View {
+/// Right after an OpenVPN profile that asks for a login: asked while the user
+/// still has it at hand, rather than later as a connection that failed.
+private struct CredentialsStep: View {
     @ObservedObject var model: AppModel
-    let xray: XraySummary
+    let id: UUID
+    let done: () -> Void
+    @State private var failure: String?
+    @State private var saving = false
 
-    var body: some View {
-        if let announce = xray.announce {
-            Label {
-                Text(announce)
-            } icon: {
-                Image(systemName: "megaphone").foregroundStyle(.secondary)
-            }
-        }
-        if let used = xray.usedBytes {
-            LabeledContent("Трафик") {
-                if let total = xray.totalBytes, total > 0 {
-                    VStack(alignment: .trailing, spacing: 4) {
-                        ProgressView(value: Double(min(used, total)), total: Double(total))
-                            .frame(width: 160)
-                            .tint(used * 10 >= total * 9 ? Color.orange : Color.accentColor)
-                        Text("\(size(used)) из \(size(total))").foregroundStyle(.secondary)
-                    }
-                } else {
-                    Text("\(size(used)), без лимита").foregroundStyle(.secondary)
-                }
-            }
-        }
-        if let expires = xray.expiresAt {
-            LabeledContent("Действует") {
-                Text("до \(expires.formatted(date: .abbreviated, time: .omitted)) · \(expires.formatted(.relative(presentation: .named)))")
-                    .foregroundStyle(expires.timeIntervalSinceNow < 3 * 86_400 ? .orange : .secondary)
-            }
-        }
-        LabeledContent("Обновлена") {
-            HStack {
-                if let updated = xray.updatedAt {
-                    Text(updated.formatted(Calendar.current.isDateInToday(updated) ? .dateTime.hour().minute() : .dateTime.day().month().hour().minute()))
-                        .foregroundStyle(.secondary)
-                }
-                Button("Обновить") { Task { await model.updateXray(.init(refresh: true)) } }
-                    .disabled(model.updatingXray)
-            }
-        }
-        if xray.supportURL != nil || xray.webPageURL != nil {
-            LabeledContent("Провайдер") {
-                HStack(spacing: 12) {
-                    if let url = xray.supportURL { Link("Поддержка", destination: url) }
-                    if let url = xray.webPageURL { Link("Сайт", destination: url) }
-                }
-            }
-        }
-    }
-
-    private func size(_ bytes: Int64) -> String { ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file) }
-}
-
-private struct UserAgentRow: View {
-    @ObservedObject var model: AppModel
-    let xray: XraySummary
-    @State private var agent = ""
-
-    var body: some View {
-        LabeledContent("User-Agent") {
-            HStack {
-                TextField("User-Agent", text: $agent, prompt: Text(XrayProfileParser.defaultUserAgent))
-                    .labelsHidden()
-                    .onAppear { agent = xray.userAgent ?? "" }
-                    .onSubmit(apply)
-                Button("Применить", action: apply)
-                    .disabled(model.updatingXray || agent == (xray.userAgent ?? ""))
-            }
-        }
-        Note("Если подписка отдаёт заглушку «Обновите приложение», укажите User-Agent приложения, которое она ждёт, например Happ.")
-    }
-
-    private func apply() {
-        Task { await model.updateXray(.init(refresh: true, userAgent: agent)) }
-    }
-}
-
-private struct RulesPage: View {
-    @ObservedObject var model: AppModel
-    @State private var checkHost = ""
-    @State private var exported = false
-    @State private var showsFormat = false
+    private var password: String { model.passwords[id] ?? "" }
 
     var body: some View {
         Form {
             Section {
-                RuleEditor(text: $model.routing.corporate, placeholder: "corp.example.com\n10.0.0.0/8")
-            } header: {
-                RuleHeader(symbol: VPNKind.openVPN.symbol, title: "Через рабочий VPN", subtitle: "Рабочие сайты и внутренние сети компании", count: entries(model.routing.corporate))
+                TextField("Логин", text: Binding(
+                    get: { model.usernames[id] ?? model.connection(id)?.username ?? "" },
+                    set: { model.usernames[id] = $0 }
+                ))
+                SecureField("Пароль", text: Binding(get: { password }, set: { model.passwords[id] = $0 }))
+                    .onSubmit(save)
             } footer: {
-                Note(model.settings.useOpenVPN
-                    ? "Если адрес есть в обоих списках, он пойдёт через рабочий VPN."
-                    : "Рабочий VPN сейчас выключен, и этот список не действует.")
+                Note("Профиль спрашивает логин и пароль — те же, что в официальном клиенте OpenVPN. Поменять их можно на странице «VPN».")
             }
-            Section {
-                LabeledContent("Все сайты в зонах") {
-                    HStack(spacing: 14) {
-                        Toggle(".ru", isOn: $model.routing.directRU)
-                        Toggle(".su", isOn: $model.routing.directSU)
-                        Toggle(".рф", isOn: $model.routing.directRF)
-                    }
-                    .toggleStyle(.checkbox)
-                }
-                RuleEditor(text: $model.routing.direct, placeholder: "example.com\n192.168.0.0/16")
-            } header: {
-                RuleHeader(symbol: "arrow.right", title: "Напрямую, без VPN", subtitle: "Сайты, которые должны открываться через ваш обычный интернет", count: entries(model.routing.direct))
-            }
-            Section {
-                RouteRow(
-                    symbol: VPNKind.amneziaWG.symbol, title: "Всё, чего нет в списках выше", detail: nil,
-                    target: model.settings.useAmneziaWG ? "через \(VPNKind.amneziaWG.lowercasedName)" : "напрямую"
-                )
-            }
-            Section {
-                HStack {
-                    TextField("Сайт или IP", text: $checkHost, prompt: Text("site.org"))
-                        .labelsHidden()
-                        .onSubmit { model.checkRoute(checkHost) }
-                    Button("Проверить") { model.checkRoute(checkHost) }
-                        .disabled(checkHost.trimmingCharacters(in: .whitespaces).isEmpty || model.checkingRoute)
-                    if model.checkingRoute { ProgressView().controlSize(.small) }
-                }
-                if let check = model.routeCheck {
-                    RouteCheckRow(check: check, via: model.via(check.interface))
-                    HStack {
-                        Spacer()
-                        Button("Добавить в «Напрямую»") { model.addRule(check.host, to: .direct) }
-                        if model.settings.useOpenVPN {
-                            Button("Добавить в «Через рабочий VPN»") { model.addRule(check.host, to: .corporate) }
-                        }
-                    }
-                    .controlSize(.small)
-                    .help("Сайт попадёт в список, и правила сразу применятся")
-                }
-            } header: {
-                RuleHeader(symbol: "magnifyingglass", title: "Проверка", subtitle: "Открывает настоящее соединение и показывает, через что оно прошло")
-            } footer: {
-                Note("Проверяются применённые правила. Какие соединения идут через что прямо сейчас — в «Диагностике», вкладка «Трафик».")
+            if let failure {
+                Section { Label(failure, systemImage: "xmark.octagon.fill").foregroundStyle(.red) }
             }
         }
         .formStyle(.grouped)
-        // Plain bordered buttons in the page itself: in the toolbar they drew
-        // grey and read as disabled.
-        .safeAreaInset(edge: .top, spacing: 0) {
-            EdgeBar(divider: .bottom) {
-                Button { showsFormat.toggle() } label: {
-                    Label("Как записывать", systemImage: "questionmark.circle")
+        .navigationTitle("Логин и пароль")
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Позже", action: done)
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(saving)
+            }
+            ToolbarItem(placement: .confirmationAction) {
+                HStack {
+                    if saving { ProgressView().controlSize(.small) }
+                    Button("Сохранить", action: save)
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(saving || password.isEmpty)
                 }
-                .popover(isPresented: $showsFormat, arrowEdge: .bottom) { FormatHelp() }
-                Spacer()
-                // Text only: the document symbols stood taller than the button.
-                Button(exported ? "Скопировано" : "Экспорт") {
-                    model.exportRules()
-                    exported = true
-                    Task {
-                        try? await Task.sleep(for: .seconds(1.5))
-                        exported = false
-                    }
-                }
-                .help("Скопировать маршруты в буфер обмена")
-                Button("Импорт", action: model.importRules)
-                .help("Вставить маршруты из буфера обмена; применить их останется кнопкой «Применить»")
             }
         }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            let error = model.rulesError
-            EdgeBar {
-                Group {
-                    if let error {
-                        Label(error, systemImage: "xmark.octagon.fill").foregroundStyle(.red).lineLimit(2)
-                    } else if model.rulesChanged {
-                        Label("Есть неприменённые изменения", systemImage: "pencil.circle.fill").foregroundStyle(.orange)
+    }
+
+    private func save() {
+        guard !saving, !password.isEmpty else { return }
+        saving = true
+        failure = nil
+        Task {
+            failure = await model.storeCredentials(id)
+            saving = false
+            if failure == nil { done() }
+        }
+    }
+}
+
+/// Status, expiry and traffic in two short lines — just enough to pick a
+/// server by. Everything else about the subscription is in the ⋯ menu.
+private struct CompactSubscriptionStatus: View {
+    let xray: XraySummary
+    let status: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 4) {
+                if let status { Text(status) }
+                if let expires = xray.expiresAt {
+                    if status != nil { Text("·").foregroundStyle(.secondary) }
+                    Text(expires < .now ? "истекла" : "до \(expires.formatted(date: .abbreviated, time: .omitted))")
+                        .foregroundStyle(expires.timeIntervalSinceNow < 3 * 86_400 ? .orange : .secondary)
+                }
+            }
+            .font(.callout)
+            if let used = xray.usedBytes {
+                Text(trafficText(used)).font(.callout).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func trafficText(_ used: Int64) -> String {
+        let usedText = ByteCountFormatter.string(fromByteCount: used, countStyle: .file)
+        guard let total = xray.totalBytes, total > 0 else { return "\(usedText), без лимита" }
+        return "\(usedText) из \(ByteCountFormatter.string(fromByteCount: total, countStyle: .file))"
+    }
+}
+
+/// Shared by every ping value: the value plus a check on request, since a lost
+/// packet or a still-settling tunnel can flip one check to «нет ответа» that
+/// the next one answers fine. Laid out as a System Settings row with an action.
+private struct PingRow: View {
+    let ping: PingState?
+    let checking: Bool
+    let retry: () -> Void
+
+    var body: some View {
+        LabeledContent("Ping") {
+            HStack {
+                if checking {
+                    ProgressView().controlSize(.small)
+                } else if let ping {
+                    Text(ping.text).foregroundStyle(ping.color)
+                } else {
+                    Text("—").foregroundStyle(.secondary)
+                }
+                Button("Проверить", action: retry)
+                    .disabled(checking)
+            }
+        }
+    }
+}
+
+/// Some providers put a human-readable status in the first announcement line.
+/// Keep arbitrary provider text intact, but present that common field as metadata.
+private struct SubscriptionAnnouncement {
+    let status: String?
+    let details: String?
+
+    init(_ raw: String?) {
+        guard let raw else {
+            status = nil
+            details = nil
+            return
+        }
+        var lines = raw.split(whereSeparator: \.isNewline).map(String.init)
+        var parsedStatus: String?
+        if let first = lines.first {
+            for marker in ["Подписка:", "Subscription:"] {
+                guard let range = first.range(of: marker, options: .caseInsensitive) else { continue }
+                let value = first[range.upperBound...].trimmingCharacters(in: .whitespaces)
+                if !value.isEmpty {
+                    switch value.lowercased() {
+                    case "active": parsedStatus = "Активна"
+                    case "inactive": parsedStatus = "Неактивна"
+                    case "expired": parsedStatus = "Истекла"
+                    default: parsedStatus = value
+                    }
+                    lines.removeFirst()
+                }
+                break
+            }
+        }
+        let remaining = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        status = parsedStatus
+        details = remaining.isEmpty ? nil : remaining
+    }
+}
+
+/// The routes, in the order that settles a site two of them claim, and the
+/// one picked for editing. Everything here is a draft until «Применить».
+private struct RulesPage: View {
+    @ObservedObject var model: AppModel
+    @State private var exported = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HSplitView {
+                DirectionList(model: model)
+                    .frame(minWidth: 180, idealWidth: 240, maxWidth: 400)
+                // A container of its own, not a Group: a Group hands the split view the
+                // editor itself, which is replaced on every pick and reset the divider.
+                ZStack {
+                    if let id = model.selectedDirection, model.routing.directions.contains(where: { $0.id == id }) {
+                        DirectionEditor(model: model, id: id)
+                            .id(id)
                     } else {
-                        Label("Правила применены", systemImage: "checkmark.circle").foregroundStyle(.secondary)
+                        ContentUnavailableView("Выберите направление", systemImage: "arrow.triangle.branch", description: Text("Или добавьте новое кнопкой «+»."))
                     }
                 }
-                .font(.callout)
+                .frame(minWidth: 360, maxWidth: .infinity, maxHeight: .infinity)
+            }
+            // At the foot of the page, as in the old Network pane: always in place,
+            // active only once there is something to apply. Under the split view,
+            // not a safe-area inset over it: the inset does not reach the forms
+            // inside, and it hid their last rows.
+            Divider()
+            HStack {
+                if model.rulesError != nil {
+                    Label("Ошибка в правилах", systemImage: "xmark.octagon.fill").foregroundStyle(.red)
+                } else if model.rulesChanged {
+                    Label("Есть неприменённые изменения", systemImage: "exclamationmark.circle.fill").foregroundStyle(.orange)
+                } else {
+                    Text("Маршруты применены").foregroundStyle(.secondary)
+                }
                 Spacer()
                 Button("Отменить", action: model.revertRules)
                     .disabled(!model.rulesChanged)
                 Button("Применить", action: model.saveRules)
                     .keyboardShortcut("s")
                     .buttonStyle(.borderedProminent)
-                    .disabled(!model.rulesChanged || error != nil)
+                    .disabled(!model.rulesChanged || model.rulesError != nil)
+            }
+            .padding()
+            .background(.bar)
+        }
+        .sheet(isPresented: $model.addingConnection) { AddConnectionSheet(model: model) }
+        .onAppear {
+            if model.selectedDirection == nil { model.selectedDirection = model.routing.directions.first?.id }
+        }
+        .toolbar {
+            ToolbarItemGroup(placement: .automatic) {
+                Button {
+                    model.exportRules()
+                    exported = true
+                    Task {
+                        try? await Task.sleep(for: .seconds(1.5))
+                        exported = false
+                    }
+                } label: {
+                    // Words, not an icon: the icons said nothing, and icon with title drew broken.
+                    Text(exported ? "Скопировано в буфер обмена" : "Скопировать маршруты")
+                }
+                .help("Скопировать в буфер обмена названия направлений и их списки сайтов — чтобы вставить на другом Mac или отправить кому-то. Сами VPN не копируются")
+                Button("Вставить маршруты", action: model.importRules)
+                .help("Вставить направления и списки сайтов, скопированные кнопкой «Скопировать маршруты». Применить их останется кнопкой «Применить»")
             }
         }
+    }
+}
+
+/// Over a list of sites: what it is for, with how to write it right by it.
+private struct RuleHeader: View {
+    let title: String
+    @Binding var showsFormat: Bool
+
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            HelpLink { showsFormat.toggle() }
+                .popover(isPresented: $showsFormat, arrowEdge: .trailing) { FormatHelp() }
+                .help("Как записывать")
+        }
+    }
+}
+
+private struct DirectionList: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        List(selection: $model.selectedDirection) {
+            ForEach(model.routing.directions) { direction in
+                // A line each, not side by side: in a narrow list they were cut to «…».
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(direction.name).lineLimit(1)
+                        .foregroundStyle(direction.enabled ? .primary : .secondary)
+                    Text(model.vpnTitle(direction))
+                        .font(.subheadline).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    let notes = [direction.enabled ? nil : "Выключено", model.routing.defaultDirection == direction.id ? "Остальной трафик" : nil].compactMap { $0 }
+                    if !notes.isEmpty {
+                        Text(notes.joined(separator: " · ")).font(.subheadline).foregroundStyle(.tertiary)
+                    }
+                }
+                .padding(.vertical, 2)
+                .tag(direction.id)
+                .contextMenu {
+                    Button("Удалить направление…", role: .destructive) { model.deleteDirection(direction.id) }
+                }
+            }
+            .onMove(perform: model.moveDirections)
+        }
+        .listStyle(.inset)
+        // The list's own add and remove, under it as in System Settings.
+        .safeAreaInset(edge: .bottom) {
+            HStack {
+                ControlGroup {
+                    Button(action: model.addDirection) { Label("Добавить направление", systemImage: "plus") }
+                    Button {
+                        if let id = model.selectedDirection { model.deleteDirection(id) }
+                    } label: { Label("Удалить направление", systemImage: "minus") }
+                        .disabled(model.selectedDirection == nil)
+                }
+                .fixedSize()
+                Spacer()
+            }
+            .padding()
+        }
+    }
+}
+
+private struct DirectionEditor: View {
+    @ObservedObject var model: AppModel
+    let id: UUID
+
+    /// By id, not index: a route removed or moved under the editor must not
+    /// leave it writing into its neighbour.
+    private var direction: Binding<Direction> {
+        Binding(
+            get: { model.routing.directions.first { $0.id == id } ?? Direction(id: id, name: "", path: .unset) },
+            set: { value in
+                guard let index = model.routing.directions.firstIndex(where: { $0.id == id }) else { return }
+                model.routing.directions[index] = value
+            }
+        )
+    }
+    private var connection: ConnectionSummary? { model.connection(direction.wrappedValue.connection) }
+
+    var body: some View {
+        Form {
+            if let error = model.rulesError {
+                Section { Label(error, systemImage: "xmark.octagon.fill").foregroundStyle(.red) }
+            }
+            Section {
+                TextField("Название", text: direction.name)
+                Picker("VPN", selection: Binding(
+                    get: { direction.wrappedValue.path },
+                    set: { path in
+                        var value = direction.wrappedValue
+                        // The server of another subscription means nothing here. A route
+                        // waiting for its VPN is off for want of one, so picking one turns it on.
+                        value.server = nil
+                        if case .vpn = path, value.path == .unset { value.enabled = true }
+                        value.path = path
+                        direction.wrappedValue = value
+                    }
+                )) {
+                    Text("Без VPN").tag(Direction.Path.direct)
+                    ForEach(model.connections) { item in
+                        Text("\(item.title) · \(item.protocolTitle ?? item.kind.title)").tag(Direction.Path.vpn(item.id))
+                    }
+                    if direction.wrappedValue.path == .unset || (direction.wrappedValue.connection != nil && connection == nil) {
+                        Text("Не выбран").tag(direction.wrappedValue.path)
+                    }
+                }
+                if let connection, let xray = connection.xray, xray.servers.count > 1 {
+                    Picker("Сервер", selection: Binding(
+                        get: { model.serverIndex(direction.wrappedValue, xray) },
+                        set: { index in
+                            guard xray.servers.indices.contains(index) else { return }
+                            direction.wrappedValue.server = .init(xray.servers[index])
+                        }
+                    )) {
+                        ForEach(Array(xray.servers.enumerated()), id: \.offset) { index, server in
+                            Text("\(server.name) · \(server.protocolTitle)").tag(index)
+                        }
+                    }
+                }
+                pingRow
+                // «Без VPN» is a choice made, not a VPN missing.
+                if direction.wrappedValue.path != .direct {
+                    HStack {
+                        Spacer()
+                        Button("Добавить новый VPN…") { model.addVPN(for: id) }
+                    }
+                }
+                Toggle(isOn: Binding(
+                    get: { model.routing.defaultDirection == id },
+                    set: { model.routing.defaultDirection = $0 ? id : (model.routing.defaultDirection == id ? nil : model.routing.defaultDirection) }
+                )) {
+                    Text("Для остального трафика")
+                    Text("Сюда пойдёт всё, чего нет в правилах других направлений, поэтому своих правил ему не нужно")
+                }
+                if direction.wrappedValue.path != .direct {
+                    Toggle(isOn: direction.blockWhenDown) {
+                        Text("Блокировать, если VPN отключился")
+                        Text("Пока VPN не подключён, сайты направления не открываются. Выключено — идут напрямую")
+                    }
+                }
+            } header: {
+                HStack {
+                    Text(direction.wrappedValue.name.isEmpty ? "Направление" : direction.wrappedValue.name)
+                    Spacer()
+                    // On/off belongs to the whole route, so it sits by its name, as in System Settings.
+                    Toggle("Включено", isOn: direction.enabled)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .labelsHidden()
+                        .help(direction.wrappedValue.enabled ? "Включено. Выключено — его сайты идут туда же, куда остальной трафик" : "Выключено: его сайты идут туда же, куда остальной трафик")
+                }
+            }
+            // The rest comes here anyway: rules of its own would change nothing.
+            if model.routing.defaultDirection != id {
+                Section {
+                    RuleEditor(text: Binding(
+                        get: { model.routing.texts[id] ?? "" },
+                        set: { model.routing.texts[id] = $0 }
+                    ), placeholder: "site.org\n10.0.0.0/8")
+                } header: {
+                    RuleHeader(title: "Правила", showsFormat: $model.showsRuleFormat)
+                } footer: {
+                    Note("Сайты, IP-адреса и диапазоны, по одному в строке. Записей: \(entries(model.routing.texts[id] ?? ""))."
+                        + (model.routing.directions.count > 1 ? " Если сайт есть в правилах нескольких направлений, он пойдёт через то, что выше в списке, даже если ниже правило точнее. Порядок меняется перетаскиванием." : ""))
+                }
+            }
+            if let connection, connection.kind == .openVPN { ServerSentSection(connection: connection) }
+        }
+        .formStyle(.grouped)
     }
 
     private func entries(_ text: String) -> Int {
         text.split(whereSeparator: \.isNewline).filter { !$0.allSatisfy(\.isWhitespace) }.count
+    }
+
+    /// Of the server the route actually uses, so a slow one is seen before switching.
+    @ViewBuilder
+    private var pingRow: some View {
+        if let connection {
+            switch connection.kind {
+            case .xray:
+                if let xray = connection.xray, xray.servers.indices.contains(model.serverIndex(direction.wrappedValue, xray)) {
+                    let server = xray.servers[model.serverIndex(direction.wrappedValue, xray)]
+                    if let endpoint = server.endpoint {
+                        PingRow(ping: model.ping(of: server), checking: model.pinging.contains(endpoint)) { model.pingServer(server) }
+                    }
+                }
+            case .amneziaWG:
+                hostPing(connection.title, connection.id)
+            case .openVPN:
+                if let host = (connection.preferredRemote ?? connection.remotes?.first)?.host { hostPing(host, connection.id) }
+            }
+        }
+    }
+
+    private func hostPing(_ host: String, _ connection: UUID) -> some View {
+        PingRow(ping: model.ping(host: host), checking: model.pinging.contains(host)) {
+            model.pingHost(host, through: model.connectedInterface(of: connection))
+        }
+    }
+}
+
+/// What an OpenVPN profile and its server route by themselves: seen here, it
+/// is clear what needs no rule and what still does. Kept from the last
+/// connection, so it is there with the VPN off too.
+private struct ServerSentSection: View {
+    let connection: ConnectionSummary
+
+    var body: some View {
+        Section {
+            if let routes = connection.profileRoutes, !routes.isEmpty {
+                LabeledContent("Сети из профиля", value: routes.joined(separator: "\n"))
+            }
+            if let pushed = connection.pushed {
+                LabeledContent("Сети", value: pushed.routes.isEmpty ? "—" : pushed.routes.joined(separator: "\n"))
+                LabeledContent("Домены", value: pushed.domains.isEmpty ? "—" : pushed.domains.joined(separator: "\n"))
+                LabeledContent("DNS", value: pushed.dns.isEmpty ? "—" : pushed.dns.joined(separator: "\n"))
+            } else {
+                Text("Появится после первого подключения").foregroundStyle(.secondary)
+            }
+        } header: {
+            HStack {
+                Text("От сервера")
+                if let received = connection.pushed?.receivedAt {
+                    Text("· получено \(received.formatted(Calendar.current.isDateInToday(received) ? .dateTime.hour().minute() : .dateTime.day().month().hour().minute()))")
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } footer: {
+            Note("Эти сети и домены сервер присылает сам — вписывать их в правила не нужно. Рабочие сайты с обычными интернет-адресами сервер не присылает: их впишите в правила.")
+        }
+    }
+}
+
+/// «Добавить в «Работа»» for any route: the site lands in its rules, applied.
+private struct AddRuleMenu: View {
+    @ObservedObject var model: AppModel
+    let host: String
+
+    var body: some View {
+        Menu("Добавить в направление") {
+            // Not the rest's route: applying drops its rules, so the site would not be kept.
+            ForEach(model.settings.directions.filter { $0.id != model.settings.defaultDirection }) { direction in
+                Button("«\(direction.name)»") { model.addRule(host, to: direction.id) }
+            }
+        }
+        .fixedSize()
+        .help("Сайт попадёт в правила направления, и они сразу применятся")
     }
 }
 
@@ -1116,27 +1520,6 @@ private struct FormatHelp: View {
     }
 }
 
-private struct RuleHeader: View {
-    let symbol: String
-    let title: String
-    let subtitle: String
-    var count: Int?
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: symbol).foregroundStyle(.secondary).frame(width: 18)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title).font(.headline)
-                Text(subtitle).font(.caption).foregroundStyle(.secondary)
-            }
-            if let count {
-                Spacer()
-                Text("\(count)").monospacedDigit().foregroundStyle(.secondary).help("Записей в списке")
-            }
-        }
-    }
-}
-
 private struct RuleEditor: View {
     @Binding var text: String
     let placeholder: String
@@ -1151,7 +1534,7 @@ private struct RuleEditor: View {
             .onChange(of: text) { old, new in
                 guard new.count - old.count > 1, new.contains("://") else { return }
                 text = new.components(separatedBy: "\n")
-                    .map { $0.contains("://") ? RoutingText.site($0.trimmingCharacters(in: .whitespaces)) : $0 }
+                    .map { $0.contains("://") ? RoutingDraft.site($0.trimmingCharacters(in: .whitespaces)) : $0 }
                     .joined(separator: "\n")
             }
             .overlay(alignment: .topLeading) {
@@ -1169,6 +1552,8 @@ private struct RuleEditor: View {
 private struct GeneralPage: View {
     @ObservedObject var model: AppModel
     @AppStorage("showsMenuBarExtra") private var showsMenuBarExtra = true
+    @State private var showsResolving = false
+    @State private var showsBypasses = false
 
     var body: some View {
         Form {
@@ -1180,34 +1565,37 @@ private struct GeneralPage: View {
                 Toggle("Показывать в строке меню", isOn: $showsMenuBarExtra)
             }
             Section {
-                Toggle(isOn: $model.settings.corporateDNSFallbackToCurrent) {
-                    Text("Рабочие имена через DNS текущей сети")
-                    Text("Если рабочий VPN не прислал свой DNS. Выключено — такие запросы блокируются")
-                }
+                UserAgentRow(model: model)
             } header: {
-                Text("DNS")
+                Text("Подписки")
             }
             Section {
-                Toggle(isOn: $model.settings.killSwitch) {
-                    Text("Kill switch")
-                    Text("Блокирует трафик и DNS, пока личный VPN не подключён")
-                }
-                .disabled(!model.settings.useAmneziaWG)
-            } header: {
-                Text(VPNKind.amneziaWG.name)
-            } footer: {
-                if !model.settings.useAmneziaWG {
-                    Note("Действует, только когда используется личный VPN.")
+                DisclosureGroup(isExpanded: $showsResolving) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Limitation(
+                            title: "DNS направления",
+                            text: "Имя сайта из направления Коммутатор спрашивает у DNS его VPN через туннель: у OpenVPN — тот, что прислал сервер, у AmneziaWG — «DNS =» из профиля, у Xray — 1.1.1.1 и 8.8.8.8. Если у VPN своего DNS нет, спрашивается DNS текущей сети, иначе направление не работало бы вовсе. Пока VPN не подключён и включено «Блокировать, если VPN отключился», имена его сайтов не узнаются."
+                        )
+                        Limitation(
+                            title: "Сети и домены от рабочего сервера",
+                            text: "Сервер OpenVPN при подключении сам сообщает свои внутренние сети и домены, а в профиле бывают строки route. Всё это сразу идёт через его направление, вписывать в правила не нужно, — список виден на «Маршрутах» в блоке «От сервера». Если два рабочих VPN называют своими одни и те же сети, их получает то направление, что выше в списке."
+                        )
+                    }
+                } label: {
+                    // On macOS only the chevron of a DisclosureGroup toggles it: the title
+                    // is made a button too, so clicking the words opens it as well.
+                    Button("Как направления узнают адреса и сети") { withAnimation { showsResolving.toggle() } }
+                        .buttonStyle(.plain)
                 }
             }
             Section {
                 // Folded: it matters once a site goes the wrong way, not every visit.
-                DisclosureGroup("Что обходит правила для сайтов") {
+                DisclosureGroup(isExpanded: $showsBypasses) {
                     VStack(alignment: .leading, spacing: 10) {
                         Note("Коммутатор видит, какой адрес DNS вернул для сайта, и направляет трафик на этот адрес. Всё, что узнаёт адрес мимо него, идёт по общему правилу. Правил для IP-адресов и диапазонов это не касается.")
                         Limitation(
                             title: "Безопасный DNS в браузере (DoH)",
-                            text: "Браузер спрашивает адреса у своего DNS по шифрованному каналу, мимо Коммутатора: сайт из «Напрямую» пойдёт через личный VPN, а рабочий — мимо рабочего VPN. Выключите: Chrome — Настройки → Конфиденциальность и безопасность → Безопасность → «Использовать безопасный DNS»; Edge — Настройки → Конфиденциальность, поиск и службы → Безопасность; Firefox — Настройки → Приватность и защита → «DNS через HTTPS»."
+                            text: "Браузер спрашивает адреса у своего DNS по шифрованному каналу, мимо Коммутатора: сайт из направления пойдёт туда же, куда остальной трафик. Выключите: Chrome — Настройки → Конфиденциальность и безопасность → Безопасность → «Использовать безопасный DNS»; Edge — Настройки → Конфиденциальность, поиск и службы → Безопасность; Firefox — Настройки → Приватность и защита → «DNS через HTTPS»."
                         )
                         Limitation(
                             title: "Частный узел iCloud (Private Relay)",
@@ -1215,14 +1603,16 @@ private struct GeneralPage: View {
                         )
                         Limitation(
                             title: "Адреса, которые приложение уже помнит",
-                            text: "Сайт, открытый до включения VPN или до изменения правил, пойдёт по новым правилам после перезапуска приложения."
+                            text: "Сайт, открытый до включения VPN или до изменения правил, может до минуты идти прежним путём, а уже открытое соединение — до своего закрытия."
                         )
                         Limitation(
                             title: "Общие адреса CDN",
-                            text: "Правило для одного сайта на общем адресе направит тем же путём и остальные сайты на этом адресе."
+                            text: "Трафик разводится по адресу, а не по имени сайта. Если сайты из разных направлений получили один адрес (так бывает у Cloudflare и других CDN), оба пойдут через то направление, что выше в списке, — пока открыто соединение и ещё минуту после. «Проверить сайт» на «Обзоре» показывает, какой сайт занял адрес."
                         )
                     }
-                    .padding(.top, 6)
+                } label: {
+                    Button("Что обходит правила для сайтов") { withAnimation { showsBypasses.toggle() } }
+                        .buttonStyle(.plain)
                 }
             }
             Section {
@@ -1249,8 +1639,35 @@ private struct GeneralPage: View {
         }
         .formStyle(.grouped)
         .onChange(of: model.settings.launchAtLogin) { _, _ in model.updateGeneralSettings() }
-        .onChange(of: model.settings.corporateDNSFallbackToCurrent) { _, _ in model.updateGeneralSettings() }
-        .onChange(of: model.settings.killSwitch) { _, _ in model.updateGeneralSettings() }
+    }
+}
+
+/// One User-Agent for every subscription: providers tell clients apart by it,
+/// and some hand a list only to the client they know.
+private struct UserAgentRow: View {
+    @ObservedObject var model: AppModel
+    @State private var agent = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            LabeledContent("User-Agent") {
+                HStack {
+                    TextField("User-Agent", text: $agent, prompt: Text(XrayProfileParser.defaultUserAgent))
+                        .labelsHidden()
+                        .onAppear { agent = model.settings.subscriptionUserAgent ?? "" }
+                        .onSubmit(apply)
+                    Button("Применить", action: apply)
+                        .disabled(agent.trimmingCharacters(in: .whitespaces) == (model.settings.subscriptionUserAgent ?? ""))
+                }
+            }
+            Note("С ним Коммутатор загружает все подписки; после изменения они сразу обновятся. Пусто — \(XrayProfileParser.defaultUserAgent).")
+        }
+    }
+
+    private func apply() {
+        let value = agent.trimmingCharacters(in: .whitespaces)
+        model.settings.subscriptionUserAgent = value.isEmpty ? nil : value
+        model.updateGeneralSettings()
     }
 }
 
@@ -1263,23 +1680,32 @@ private struct Limitation: View {
             Text(title)
             Note(text)
         }
-        .padding(.vertical, 2)
     }
 }
 
 private struct DiagnosticsPage: View {
     @ObservedObject var model: AppModel
     @State private var showsTraffic = false
+    @State private var logQuery = ""
+    @State private var trafficFilter = ""
 
     var body: some View {
         Group {
             if showsTraffic {
-                TrafficView(model: model, traffic: model.traffic)
+                TrafficView(model: model, traffic: model.traffic, filter: trafficFilter)
             } else {
-                LogView(model: model)
+                LogView(model: model, query: logQuery)
             }
         }
-        // Switching views belongs in the toolbar, not in the content it switches.
+        // The toolbar holds only what both tabs share: the switcher, centred, and
+        // one search field. With each tab's own buttons there, the switcher sat
+        // centred between different widths and jumped on every switch; those
+        // buttons are in each tab's bar instead.
+        .searchable(
+            text: showsTraffic ? $trafficFilter : $logQuery,
+            placement: .toolbar,
+            prompt: showsTraffic ? "Сайт, адрес или приложение" : "Поиск по журналу"
+        )
         .toolbar {
             ToolbarItem(placement: .principal) {
                 Picker("Раздел", selection: $showsTraffic) {
@@ -1293,20 +1719,54 @@ private struct DiagnosticsPage: View {
     }
 }
 
+/// A tab's own controls, over its content and under the shared toolbar.
+private struct DiagnosticsBar<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack { content }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 8)
+            Divider()
+        }
+    }
+}
+
 /// The daemon's log as it is written, the way a terminal tail shows it.
 private struct LogView: View {
     @ObservedObject var model: AppModel
+    let query: String
     @State private var follow = true
     @State private var copied = false
-    @State private var query = ""
+    @State private var limit = 20
 
     private var lines: [String] {
         let needle = query.trimmingCharacters(in: .whitespaces)
-        return needle.isEmpty ? model.logLines : model.logLines.filter { $0.localizedCaseInsensitiveContains(needle) }
+        return (needle.isEmpty ? model.logLines : model.logLines.filter { $0.localizedCaseInsensitiveContains(needle) }).suffix(limit)
     }
 
     var body: some View {
         VStack(spacing: 0) {
+            DiagnosticsBar {
+                Toggle("Прокручивать к новым", isOn: $follow).toggleStyle(.checkbox)
+                Picker("Показывать", selection: $limit) {
+                    ForEach([20, 50, 100, 200], id: \.self) { Text("Последние \($0)").tag($0) }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .fixedSize()
+                Spacer()
+                Button(copied ? "Скопировано" : "Скопировать") {
+                    model.copyDiagnostics(lines)
+                    copied = true
+                    Task {
+                        try? await Task.sleep(for: .seconds(1.5))
+                        copied = false
+                    }
+                }
+                .help("Показанные строки журнала вместе со сведениями о Mac и приложении для разбора. Пароли в журнал не попадают")
+            }
             Text(model.diagnostics)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -1315,23 +1775,6 @@ private struct LogView: View {
                 .padding(.vertical, 8)
             Divider()
             LogText(lines: lines, follow: follow)
-            EdgeBar {
-                TextField("Поиск", text: $query, prompt: Text("Поиск по журналу"))
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 240)
-                if !query.isEmpty { Text("Найдено: \(lines.count)").foregroundStyle(.secondary) }
-                Toggle("Прокручивать к новым", isOn: $follow).toggleStyle(.checkbox)
-                Spacer()
-                Button(copied ? "Скопировано" : "Скопировать всё") {
-                    model.copyDiagnostics()
-                    copied = true
-                    Task {
-                        try? await Task.sleep(for: .seconds(1.5))
-                        copied = false
-                    }
-                }
-                .help("Пароли в журнал не попадают")
-            }
         }
         .task {
             while !Task.isCancelled {
@@ -1394,7 +1837,7 @@ private struct LogText: NSViewRepresentable {
 private struct TrafficView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var traffic: TrafficMonitor
-    @State private var filter = ""
+    let filter: String
     @State private var selection = Set<TrafficEntry.ID>()
     @State private var showsHelp = false
     /// Empty: the order connections arrived in.
@@ -1410,6 +1853,16 @@ private struct TrafficView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            DiagnosticsBar {
+                Toggle("Записывать соединения", isOn: $model.settings.watchTraffic).toggleStyle(.checkbox)
+                Spacer()
+                Button("Очистить", action: traffic.clear)
+                    .disabled(traffic.entries.isEmpty)
+                Button { showsHelp.toggle() } label: {
+                    Label("Как читать", systemImage: "questionmark.circle")
+                }
+                .popover(isPresented: $showsHelp, arrowEdge: .bottom) { TrafficHelp() }
+            }
             if traffic.entries.isEmpty, !model.settings.watchTraffic {
                 ContentUnavailableView {
                     Label("Запись соединений выключена", systemImage: "tablecells")
@@ -1446,7 +1899,9 @@ private struct TrafficView: View {
                     }
                     TableColumn("Через", value: \.via) { entry in
                         HStack(spacing: 5) {
-                            Circle().fill(Self.color(entry.via)).frame(width: 7, height: 7)
+                            Image(systemName: "circle.fill")
+                                .font(.caption2)
+                                .foregroundStyle(Self.color(entry.via))
                             Text(entry.via)
                             if let early = entry.early, entry.routerDNS == nil { Text(early.tag).foregroundStyle(.secondary) }
                         }
@@ -1458,9 +1913,11 @@ private struct TrafficView: View {
                 .contextMenu(forSelectionType: TrafficEntry.ID.self) { ids in
                     if let entry = traffic.entries.first(where: { ids.contains($0.id) }) {
                         let host = entry.name ?? entry.flow.address
-                        Button("Всегда напрямую: \(host)") { model.addRule(host, to: .direct) }
-                        if model.settings.useOpenVPN {
-                            Button("Всегда через рабочий VPN: \(host)") { model.addRule(host, to: .corporate) }
+                        Menu("Добавить \(host) в направление") {
+                            // Not the rest's route: applying drops its rules, so the site would not be kept.
+                            ForEach(model.settings.directions.filter { $0.id != model.settings.defaultDirection }) { direction in
+                                Button("«\(direction.name)»") { model.addRule(host, to: direction.id) }
+                            }
                         }
                         Divider()
                         Button("Скопировать \(host)") {
@@ -1470,52 +1927,27 @@ private struct TrafficView: View {
                     }
                 }
             }
-            EdgeBar {
-                Button { showsHelp.toggle() } label: {
-                    Label("Как читать", systemImage: "questionmark.circle")
-                }
-                .popover(isPresented: $showsHelp, arrowEdge: .top) { TrafficHelp() }
-                TextField("Фильтр", text: $filter, prompt: Text("Фильтр: сайт, адрес или приложение"))
-                    .textFieldStyle(.roundedBorder)
-                    .frame(maxWidth: 280)
-                Spacer()
-                Toggle("Записывать соединения", isOn: $model.settings.watchTraffic).toggleStyle(.checkbox)
-                Text("Последние \(traffic.entries.count) из 1000").foregroundStyle(.secondary)
-                Button("Очистить", action: traffic.clear)
-                    .disabled(traffic.entries.isEmpty)
-            }
         }
         .onChange(of: model.settings.watchTraffic) { _, _ in model.updateGeneralSettings() }
     }
 
     private static func color(_ via: String) -> Color {
-        switch via {
-        case VPNKind.openVPN.name: .blue
-        case VPNKind.amneziaWG.name: .purple
-        case _ where via.hasPrefix("Чужой"): .orange
-        default: .gray
-        }
+        if via.hasPrefix("Чужой") { return .orange }
+        if via.hasPrefix("Напрямую") || via.hasPrefix("Закрытый") { return .gray }
+        return .purple
     }
 }
 
 /// Why a row reads as it does, for the tooltip over it: a direct row or a
 /// bare address looked like a leak when it was only older than the tunnel.
 private extension TrafficEntry {
-    /// The daemon's own lookups. Each class of names has its server on a path of
-    /// its own — the network's on the physical interface, the company's through
-    /// the work VPN, the rest through the personal one — so the path names it.
+    /// The daemon's own lookups. Each route's names are asked of its own
+    /// resolver, through its own tunnel, so the path names it.
     var routerDNS: (label: String, help: String)? {
         guard owner.process == "VPNRouterDaemon", flow.port == "53" else { return nil }
-        switch via {
-        case VPNKind.amneziaWG.name:
-            return ("DNS личного VPN", "Коммутатор спрашивает имя сайта у DNS личного VPN через туннель")
-        case VPNKind.openVPN.name:
-            return ("DNS рабочей сети", "Коммутатор спрашивает рабочее имя у DNS компании")
-        case _ where via.hasPrefix("Напрямую"):
-            return ("DNS текущей сети", "Коммутатор спрашивает имя из «Напрямую» у DNS вашей сети")
-        default:
-            return nil
-        }
+        if via.hasPrefix("Напрямую") { return ("DNS текущей сети", "Коммутатор спрашивает имя у DNS вашей сети") }
+        if via.hasPrefix("Чужой") || via.hasPrefix("Закрытый") { return nil }
+        return ("DNS «\(via)»", "Коммутатор спрашивает имя сайта у DNS этого направления через его туннель")
     }
 
     var destination: String {
@@ -1564,13 +1996,14 @@ private struct TrafficHelp: View {
             Text("Как читать «Трафик»").font(.headline)
             Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 10, verticalSpacing: 6) {
                 ForEach([
-                    (Color.blue, "Рабочий VPN"),
-                    (.purple, "Личный VPN"),
+                    (Color.purple, "Через VPN направления — его название"),
                     (.gray, "Напрямую — по правилам или потому, что открыто раньше VPN; «Закрытый интерфейс» — прежний туннель"),
                     (.orange, "Чужой туннель — его создала другая программа"),
                 ], id: \.1) { color, meaning in
                     GridRow {
-                        Circle().fill(color).frame(width: 7, height: 7)
+                        Image(systemName: "circle.fill")
+                            .font(.caption2)
+                            .foregroundStyle(color)
                         Text(meaning).font(.callout)
                     }
                 }
@@ -1594,8 +2027,8 @@ private struct TrafficHelp: View {
                     Text("Обратное имя адреса. Обычный DNS отвечает, какой адрес у сайта, а обратный — как называется сам адрес. Это имя записывает владелец адреса — провайдер или хостинг: оно говорит, чей это сервер, но не какой сайт на нём открыт.")
                 }
                 GridRow {
-                    Text("DNS личного VPN").font(.callout.weight(.medium))
-                    Text("Запрос имени от самого Коммутатора. Имена сайтов не из правил он спрашивает у DNS личного VPN через туннель, рабочие — у DNS компании, из «Напрямую» и .ru — у DNS вашей сети.")
+                    Text("DNS «Работа»").font(.callout.weight(.medium))
+                    Text("Запрос имени от самого Коммутатора. Имя сайта он спрашивает у DNS того направления, которому сайт принадлежит, через его туннель; для направлений без VPN — у DNS вашей сети.")
                 }
             }
             .font(.callout)
@@ -1620,6 +2053,9 @@ private struct RouteCheckRow: View {
             } icon: {
                 Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
             }
+            if let shared = check.sharedWith {
+                Note("Этот адрес последним получил сайт \(shared): у сайтов общий адрес, и путь выбрал тот, чьё правило выше в списке направлений.")
+            }
         } else {
             Label {
                 Text("\(check.host) → \(check.address): соединение не установилось. По таблице маршрутов — \(via).")
@@ -1630,35 +2066,32 @@ private struct RouteCheckRow: View {
     }
 }
 
-private struct EdgeBar<Content: View>: View {
-    var divider: VerticalEdge = .top
-    @ViewBuilder let content: Content
-
-    var body: some View {
-        HStack(spacing: 10) { content }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.bar)
-            .overlay(alignment: divider == .top ? .top : .bottom) { Divider() }
-    }
-}
 
 // MARK: - Shared pieces
 
-private struct StatusBadge: View {
-    let state: ProtectionState
-    let size: CGFloat
+/// Fast daemon replies should feel immediate, not flash a spinner for one frame.
+/// The standard progress control appears only when an operation is perceptible.
+private struct DelayedProgressView: View {
+    let active: Bool
+    @State private var visible = false
 
     var body: some View {
-        // No .fill variant: the symbol's own filled ends carry the state.
-        Image(systemName: state.symbol)
-            .font(.system(size: size * 0.5, weight: .semibold))
-            .symbolEffect(.pulse, isActive: state == .starting)
-            .foregroundStyle(.white)
-            .frame(width: size, height: size)
-            .background(state.color.gradient, in: RoundedRectangle(cornerRadius: size * 0.28, style: .continuous))
-            .accessibilityHidden(true)
+        Group {
+            if visible {
+                ProgressView().controlSize(.small)
+            }
+        }
+        .task(id: active) {
+            visible = false
+            guard active else { return }
+            do {
+                try await Task.sleep(for: .milliseconds(200))
+                guard !Task.isCancelled else { return }
+                visible = true
+            } catch {
+                // A completed operation cancels the delay before it becomes visible.
+            }
+        }
     }
 }
 
@@ -1666,7 +2099,7 @@ private struct PowerSwitch: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack {
             if model.pendingEnabled != nil || model.status.protection == .starting {
                 ProgressView().controlSize(.small)
             }
@@ -1679,206 +2112,131 @@ private struct PowerSwitch: View {
     }
 }
 
-/// Both VPNs, each with the switch that keeps it in or out of use.
-private struct TunnelRows: View {
+/// Marks the route that takes what no rule claims.
+/// Every route, each with the switch that keeps it on or off.
+private struct DirectionRows: View {
     @ObservedObject var model: AppModel
-    /// The window adds the way to a missing profile and to the log.
+    /// The window adds the way to a missing VPN and to the log.
     var inWindow = false
 
     var body: some View {
-        ForEach(VPNKind.allCases, id: \.self) { kind in
-            TunnelRow(
-                kind: kind,
-                status: kind == .openVPN ? model.status.openVPN : model.status.amneziaWG,
-                hasProfile: kind == .openVPN ? model.hasOpenVPN : model.hasExit,
-                server: model.serverName(kind),
-                warning: kind == .amneziaWG && model.settings.exitEngine == .xray ? model.xray?.warning : nil,
-                inUse: model.uses(kind),
-                canTurnOff: model.uses(kind == .openVPN ? .amneziaWG : .openVPN),
-                onToggle: { model.setTunnel(kind, inUse: $0) },
-                add: inWindow ? add(kind) : nil,
-                onShowLog: inWindow ? { model.page = .diagnostics } : nil
-            )
-        }
+        ForEach(model.settings.directions) { direction in Self.row(model, direction, inWindow: inWindow) }
     }
 
-    /// The work profile is only ever a file; the personal one opens the sheet
-    /// that takes a file or any link.
-    private func add(_ kind: VPNKind) -> (title: String, action: () -> Void) {
-        kind == .openVPN
-            ? ("Добавить .ovpn…", { model.importFile(kind) })
-            : ("Добавить…", { model.page = .profiles; model.addingExit = true })
+    /// A grouped Form wants the ForEach itself in its Section: behind a view of
+    /// its own, the last row fell out of the section's box.
+    @MainActor
+    static func row(_ model: AppModel, _ direction: Direction, inWindow: Bool) -> DirectionRow {
+        DirectionRow(
+            direction: direction,
+            status: model.tunnel(of: direction),
+            vpn: model.vpnTitle(direction),
+            isDefault: model.settings.defaultDirection == direction.id,
+            routingOn: model.displayedEnabled,
+            broken: model.isBroken(direction),
+            warning: model.connection(direction.connection)?.xray?.warning,
+            onToggle: { model.setDirection(direction.id, enabled: $0) },
+            onFix: inWindow ? { model.selectedDirection = direction.id; model.page = .rules } : nil,
+            onShowLog: inWindow ? { model.page = .diagnostics } : nil
+        )
     }
 }
 
-private struct TunnelRow: View {
-    let kind: VPNKind
-    let status: TunnelStatus
-    let hasProfile: Bool
-    let server: String?
+private struct DirectionRow: View {
+    let direction: Direction
+    let status: TunnelStatus?
+    let vpn: String
+    let isDefault: Bool
+    /// The main switch: with it off, an enabled route only waits for it.
+    let routingOn: Bool
+    let broken: Bool
     let warning: String?
-    let inUse: Bool
-    let canTurnOff: Bool
     let onToggle: (Bool) -> Void
-    var add: (title: String, action: () -> Void)?
+    var onFix: (() -> Void)?
     var onShowLog: (() -> Void)?
 
+    /// LabeledContent, not a hand-made row: a grouped Form lays out its own
+    /// rows, and a custom HStack as the last one fell out of the section.
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: kind.symbol)
-                .foregroundStyle(.secondary)
-                .frame(width: 22)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(kind.name)
-                HStack(spacing: 5) {
-                    if hasProfile, inUse { Circle().fill(status.phase.color).frame(width: 7, height: 7) }
-                    Text(subtitle).lineLimit(2).help(subtitle)
+        LabeledContent {
+            HStack {
+                if direction.enabled, status?.phase == .error, !broken, let onShowLog {
+                    Button("Журнал", action: onShowLog)
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                if hasProfile, inUse, let warning {
-                    Text(warning).font(.caption).foregroundStyle(.orange)
-                }
-            }
-            Spacer()
-            if hasProfile, inUse, status.phase == .error, let onShowLog {
-                Button("Журнал", action: onShowLog).controlSize(.small)
-            }
-            if !hasProfile, let add { Button(add.title, action: add.action) }
-            // A VPN in use keeps its switch even without a profile: otherwise the
-            // other VPN could never be left to run alone.
-            if hasProfile || inUse {
-                Toggle("Использовать \(kind.lowercasedName)", isOn: Binding(get: { inUse }, set: { onToggle($0) }))
+                if broken, let onFix { Button("Выбрать VPN…", action: onFix) }
+                Toggle("«\(direction.name)»", isOn: Binding(get: { direction.enabled }, set: { onToggle($0) }))
                     .toggleStyle(.switch)
-                    .controlSize(.mini)
                     .labelsHidden()
-                    .disabled(inUse && !canTurnOff)
-                    .help(inUse && !canTurnOff
-                        ? "Хотя бы один VPN должен оставаться включённым"
-                        : inUse ? "Не использовать \(kind.lowercasedName)" : "Использовать \(kind.lowercasedName)")
+                    // Grey while VPN is off: on, but not carrying anything yet.
+                    .tint(routingOn ? nil : .gray)
+                    .help(direction.enabled ? "Выключить направление: его сайты пойдут туда же, куда остальной трафик" : "Включить направление")
             }
+        } label: {
+            Text(direction.name)
+            // Styled here, not left to the container: the menu's MenuRowStyle
+            // has no subtitle look of its own.
+            Group {
+                (live
+                    ? Text(Image(systemName: "circle.fill")).foregroundStyle(status!.phase.color) + Text(" " + subtitle)
+                    : Text(subtitle))
+                    .foregroundStyle(.secondary)
+                if direction.enabled, let warning { Text(warning).foregroundStyle(.orange) }
+            }
+            .font(.subheadline)
         }
+        .help(subtitle)
     }
 
+    /// A tunnel that is meant to be up right now, so its phase is worth a dot.
+    private var live: Bool {
+        routingOn && direction.enabled && !broken && direction.path != .direct && status != nil
+    }
+
+    /// One scheme for every row: where the traffic goes, then its state, then
+    /// whether it takes the rest. The switch already says on or off.
     private var subtitle: String {
-        guard hasProfile else { return "Профиль не добавлен" }
-        guard inUse else {
-            return kind == .openVPN
-                ? "Не используется: рабочие адреса идут как обычный трафик"
-                : "Не используется: остальной трафик идёт напрямую"
-        }
+        ([vpn, state] + [isDefault ? "остальной трафик" : nil]).compactMap { $0 }.joined(separator: " · ")
+    }
+
+    private var state: String? {
+        guard direction.enabled, !broken, direction.path != .direct else { return nil }
+        guard routingOn else { return "включится с VPN" }
+        guard let status else { return nil }
         // The daemon says why; «Ошибка» alone sent people to the log for it.
         if status.phase == .error, let message = status.message { return message }
-        let suffix = server.map { " · \($0)" } ?? ""
-        guard status.phase == .connected else { return status.phase.russianTitle + suffix }
+        guard status.phase == .connected else { return status.phase.russianTitle.lowercased() }
         let time: Date.FormatStyle = Calendar.current.isDateInToday(status.changedAt)
             ? .dateTime.hour().minute()
             : .dateTime.day().month().hour().minute()
-        return "Подключён с \(status.changedAt.formatted(time))" + suffix
-    }
-}
-
-private struct RouteRow: View {
-    let symbol: String
-    let title: String
-    let detail: String?
-    let target: String
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: symbol).foregroundStyle(.secondary).frame(width: 22)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                if let detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
-            }
-            Spacer()
-            Text(target).foregroundStyle(.secondary)
-        }
-    }
-}
-
-private struct Banners: View {
-    @ObservedObject var model: AppModel
-    var insets = EdgeInsets(top: 12, leading: 20, bottom: 0, trailing: 20)
-
-    var body: some View {
-        // Modifiers on a Group reach each child, so no banner means no gap.
-        Group {
-            if let error = model.visibleError {
-                MessageBanner(error, color: .red) { model.dismissError() }
-            } else if let message = model.systemComponentMessage {
-                MessageBanner(message, color: .orange, actions: model.componentFix.map { fix in
-                    [(fix == .install ? "Установить…" : "Открыть настройки", { model.fixSystemComponent() })]
-                } ?? [])
-            } else if let update = model.update {
-                UpdateBanner(model: model, update: update)
-            }
-        }
-        .padding(insets)
+        return "подключён с \(status.changedAt.formatted(time))"
     }
 }
 
 /// Two clicks, each the user's: download, then install, which takes VPN down.
-private struct UpdateBanner: View {
+private struct UpdateControl: View {
     @ObservedObject var model: AppModel
-    let update: AppModel.UpdateState
 
     var body: some View {
-        let version = update.release.version
-        switch update {
-        case .available:
-            MessageBanner("Доступна версия \(version)", color: .blue, symbol: "arrow.down.circle.fill", actions: [
-                ("Что нового", { model.showReleaseNotes() }), ("Скачать", { model.downloadUpdate() }),
-            ])
-        case .downloading:
-            MessageBanner("Скачивается обновление \(version)…", color: .blue, symbol: "arrow.down.circle.fill")
-        case .ready:
-            MessageBanner("Обновление \(version) скачано. VPN выключится на время обновления, Коммутатор перезапустится", color: .blue, symbol: "arrow.down.circle.fill", actions: [
-                ("Что нового", { model.showReleaseNotes() }), ("Обновить и перезапустить…", { model.installUpdate() }),
-            ])
-        case .installing:
-            MessageBanner("Устанавливается обновление \(version)…", color: .blue, symbol: "arrow.down.circle.fill")
-        }
-    }
-}
-
-private struct MessageBanner: View {
-    let message: String
-    let color: Color
-    var symbol: String?
-    /// The fix, where the banner itself can offer one.
-    let actions: [(title: String, run: () -> Void)]
-    let onDismiss: (() -> Void)?
-
-    init(_ message: String, color: Color, symbol: String? = nil, actions: [(title: String, run: () -> Void)] = [], onDismiss: (() -> Void)? = nil) {
-        self.message = message
-        self.color = color
-        self.symbol = symbol
-        self.actions = actions
-        self.onDismiss = onDismiss
-    }
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            // Errors are octagons elsewhere in the app; the triangle is for warnings.
-            Image(systemName: symbol ?? (color == .red ? "xmark.octagon.fill" : "exclamationmark.triangle.fill")).foregroundStyle(color)
-            // No fixedSize: the window's minimum is measured at a near-zero width,
-            // where a fixed height wraps into a column taller than the window and
-            // SwiftUI centres the overflow, pushing the whole window up.
-            Text(message)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            ForEach(actions.indices, id: \.self) { index in Button(actions[index].title, action: actions[index].run) }
-            if let onDismiss {
-                Button(action: onDismiss) { Image(systemName: "xmark") }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel("Скрыть сообщение")
+        if let update = model.update {
+            let version = update.release.version
+            switch update {
+            case .available:
+                Menu("Доступна версия \(version)") {
+                    Button("Скачать", action: model.downloadUpdate)
+                    Button("Что нового", action: model.showReleaseNotes)
+                }
+            case .downloading:
+                ProgressView("Скачивается \(version)…").controlSize(.small)
+            case .ready:
+                Menu("Обновление \(version) скачано") {
+                    Button("Обновить и перезапустить…", action: model.installUpdate)
+                    Button("Что нового", action: model.showReleaseNotes)
+                }
+                .help("VPN выключится на время обновления, Коммутатор перезапустится")
+            case .installing:
+                ProgressView("Устанавливается \(version)…").controlSize(.small)
             }
         }
-        .font(.callout)
-        .padding(10)
-        .background(color.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(color.opacity(0.35)))
     }
 }
 
@@ -1888,5 +2246,13 @@ private struct Note: View {
 
     var body: some View {
         Text(text).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// Under every «Ping» column and row: what it actually measures, so a good
+/// ping on a server that will not connect reads as expected, not as a bug.
+private struct PingHonestyNote: View {
+    var body: some View {
+        Note("Ping — это ICMP до хоста, отдельно от протокола VPN. Показывает, что хост в сети, но не проверяет, что сам VPN через него работает: провайдер может пропускать ping и при этом глушить именно QUIC (Hysteria2) или WireGuard/AmneziaWG.")
     }
 }

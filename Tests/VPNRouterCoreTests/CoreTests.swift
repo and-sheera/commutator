@@ -4,15 +4,23 @@ import Testing
 @testable import VPNRouterCore
 @testable import VPNRouterDaemon
 
-@Test func domainPriorityAndNormalization() throws {
-    let rules = try RuleSet(rules: [
-        .init(target: .direct, kind: .domain, value: "ru"),
-        .init(target: .corporate, kind: .domain, value: "corp.ru"),
-        .init(target: .direct, kind: .domain, value: "пример.рф"),
+private let work = UUID(), direct = UUID(), ai = UUID()
+
+private func domains(_ values: String...) -> [RoutingRule] { values.map { .init(kind: .domain, value: $0) } }
+private func networks(_ values: String...) -> [RoutingRule] { values.map { .init(kind: .cidr, value: $0) } }
+
+@Test func theHigherRouteWinsHoweverLongerTheLowerMatch() throws {
+    let rules = try RuleSet(lists: [
+        (work, domains("corp.ru")),
+        (ai, domains("openai.com")),
+        (direct, domains("ru", "пример.рф", "api.openai.com")),
     ])
-    #expect(rules.classify(domain: "www.example.ru") == .direct)
-    #expect(rules.classify(domain: "api.corp.ru") == .corporate)
-    #expect(rules.classify(domain: "example.com") == .amneziaWG)
+    #expect(rules.classify(domain: "www.example.ru") == .direction(direct))
+    #expect(rules.classify(domain: "api.corp.ru") == .direction(work))
+    // Longer, but lower on the list: the higher route keeps it.
+    #expect(rules.classify(domain: "api.openai.com") == .direction(ai))
+    #expect(rules.classify(domain: "xn--e1afmkfd.xn--p1ai") == .direction(direct))
+    #expect(rules.classify(domain: "example.com") == nil)
     #expect(RuleSet.normalizeDomain(".РФ.") == "xn--p1ai")
 }
 
@@ -35,18 +43,64 @@ import Testing
 }
 
 @Test func aPastedLinkStandsForItsSite() {
-    #expect(RoutingText.site("https://cloudflare.com/cdn-cgi/trace") == "cloudflare.com")
-    #expect(RoutingText.site("site.org") == "site.org")
-    #expect(RoutingText.site("10.0.0.0/8") == "10.0.0.0/8")
+    #expect(RoutingDraft.site("https://cloudflare.com/cdn-cgi/trace") == "cloudflare.com")
+    #expect(RoutingDraft.site("site.org") == "site.org")
+    #expect(RoutingDraft.site("10.0.0.0/8") == "10.0.0.0/8")
 }
 
-@Test func routingTextSurvivesTheClipboardAndRejectsAnythingElse() throws {
-    let text = RoutingText(corporate: "corp.example.com\n10.0.0.0/8", direct: "example.com", directRU: true, directSU: false, directRF: true)
-    #expect(RoutingText(exported: text.exported) == text)
-    #expect(RoutingText(exported: "просто текст из буфера") == nil)
-    let settings = try RoutingText(corporate: "https://site.org/path?q=1").applied(to: .init())
-    #expect(settings.rules.map(\.value) == ["site.org"])
-    #expect(throws: RouterErrorInfo.self) { try RoutingText(corporate: "not a site!").applied(to: .init()) }
+@Test func routesSurviveTheClipboardAndRejectAnythingElse() throws {
+    let vpn = UUID()
+    let settings = RouterSettings(directions: [
+        .init(id: work, name: "Работа", path: .vpn(vpn), rules: domains("corp.example.com") + networks("10.0.0.0/8")),
+        .init(id: direct, name: "Напрямую", path: .direct, rules: domains(".ru", "example.com")),
+    ], defaultDirection: nil)
+    let draft = RoutingDraft(settings: settings)
+    // Onto the same routes, by name: everything comes back as it was.
+    #expect(draft.importing(draft.exported) == draft)
+    #expect(draft.importing("просто текст из буфера") == nil)
+
+    // On a Mac without these routes they arrive off and with no VPN: run as
+    // direct, work sites would leave through the network.
+    let elsewhere = RoutingDraft(settings: .init(directions: [], defaultDirection: nil)).importing(draft.exported)
+    #expect(elsewhere?.directions.map(\.name) == ["Работа", "Напрямую"])
+    #expect(elsewhere?.directions.allSatisfy { !$0.enabled && $0.path == .unset } == true)
+    #expect(elsewhere.flatMap { $0.texts[$0.directions[0].id] } == "corp.example.com\n10.0.0.0/8")
+
+    // An export from before routes lands in the routes its lists became.
+    let old = draft.importing("[openvpn]\nnew.corp.example\n[direct]\n.ru\n.рф\n")
+    #expect(old?.directions.count == 2)
+    #expect(old?.texts[work] == "new.corp.example")
+    #expect(old?.texts[direct] == ".ru\n.рф")
+
+    var edited = draft
+    edited.texts[work] = "https://site.org/path?q=1"
+    #expect(try edited.applied(to: settings).directions[0].rules.map(\.value) == ["site.org"])
+    edited.texts[work] = "not a site!"
+    #expect(throws: RouterErrorInfo.self) { try edited.applied(to: settings) }
+
+    // The rest's route shows no rules, so it applies none, whatever the text held.
+    edited.defaultDirection = work
+    #expect(try edited.applied(to: settings).directions[0].rules.isEmpty)
+
+    // An export tells routes apart by name, so two with one name would merge.
+    edited.defaultDirection = nil
+    edited.directions[1].name = "работа "
+    #expect(throws: RouterErrorInfo.self) { try edited.applied(to: settings) }
+}
+
+@Test func serversOfOneSubscriptionThatDifferOnlyByPortAreToldApart() {
+    let servers: [XraySummary.Server] = [
+        .init(name: "US", protocolName: "vless", host: "us.example", port: 443),
+        .init(name: "US", protocolName: "vless", host: "us.example", port: 8443),
+        .init(name: "US", protocolName: "trojan", host: "us.example", port: 8443),
+    ]
+    func pick(_ choice: ServerChoice) -> Int? {
+        servers.firstIndex { choice.matches(name: $0.name, host: $0.host, port: $0.port, protocolName: $0.protocolName) }
+    }
+    #expect(servers.indices.allSatisfy { pick(.init(servers[$0])) == $0 })
+    // A pick saved before ports were kept still finds its server.
+    #expect(pick(.init(name: "US", host: "us.example")) == 0)
+    #expect(pick(.init(name: "DE", host: "us.example")) == nil)
 }
 
 @Test func nettopRowsYieldOutboundFlowsAndTheirProcess() {
@@ -78,18 +132,16 @@ import Testing
     #expect(log.lines(after: 99).lines.count == 2)
 }
 
-@Test func cidrLongestMatchAndCorporateTie() throws {
-    let rules = try RuleSet(rules: [
-        .init(target: .direct, kind: .cidr, value: "10.0.0.0/8"),
-        .init(target: .corporate, kind: .cidr, value: "10.20.0.0/16"),
-        .init(target: .corporate, kind: .cidr, value: "172.16.0.0/12"),
-        .init(target: .direct, kind: .cidr, value: "172.16.10.0/24"),
-        .init(target: .direct, kind: .cidr, value: "2001:db8::/32"),
+@Test func networksGoToTheHigherRouteEvenWhenALowerOneIsNarrower() throws {
+    let rules = try RuleSet(lists: [
+        (work, networks("10.20.0.0/16", "172.16.0.0/12")),
+        (direct, networks("10.0.0.0/8", "172.16.10.0/24", "2001:db8::/32")),
     ])
-    #expect(rules.classify(ip: "10.1.2.3") == .direct)
-    #expect(rules.classify(ip: "10.20.2.3") == .corporate)
-    #expect(rules.classify(ip: "172.16.10.1") == .corporate)
-    #expect(rules.classify(ip: "2001:db8::1") == .direct)
+    #expect(rules.classify(ip: "10.1.2.3") == direct)
+    #expect(rules.classify(ip: "10.20.2.3") == work)
+    #expect(rules.classify(ip: "172.16.10.1") == work)
+    #expect(rules.classify(ip: "2001:db8::1") == direct)
+    #expect(rules.classify(ip: "8.8.8.8") == nil)
     #expect(CIDR("10.20.99.7/16")?.description == "10.20.0.0/16")
     #expect(CIDR("2001:db8:1::abcd/48")?.description == "2001:db8:1::/48")
 }
@@ -164,8 +216,24 @@ import Testing
         """)
     #expect(profile.endpoint == "vpn.example:51820")
     #expect(profile.supportsIPv6)
+    #expect(profile.protocolTitle == "AmneziaWG")
     #expect(profile.setConf.contains("PersistentKeepalive = 25"))
     #expect(!profile.setConf.contains("Address ="))
+
+    let wireGuard = try AmneziaWGProfileParser.parse("""
+        [Interface]
+        PrivateKey = secret
+        Address = 10.0.0.2/32
+        SaveConfig = true
+
+        [Peer]
+        PublicKey = peer
+        Endpoint = vpn.example:51820
+        AllowedIPs = 0.0.0.0/0
+        """)
+    #expect(wireGuard.protocolTitle == "WireGuard")
+    // A wg-quick key: awg setconf would reject the whole profile over it.
+    #expect(!wireGuard.setConf.contains("SaveConfig"))
 }
 
 /// Mirrors Qt's `qCompress`: 4-byte big-endian uncompressed size, then a zlib
@@ -288,36 +356,47 @@ private func makeAmneziaShareLink(container: String = "amnezia-awg", protoKey: S
     #expect(message.addresses == [.init(name: "alias.example.com", address: "203.0.113.8", ttl: 30)])
 }
 
-@Test func firewallIsFailClosedPerClass() throws {
+@Test func firewallIsFailClosedPerRoute() throws {
     let policy = try FirewallPolicyRenderer.render(.init(
         physicalInterface: "en0",
-        openVPNInterface: "utun4",
-        amneziaWGInterface: nil,
-        corporate: ["10.20.0.0/16"],
-        direct: ["203.0.113.2"],
         control: ["1.1.1.1"],
-        lan: ["192.168.1.0/24"]
+        lan: ["192.168.1.0/24"],
+        lanes: [
+            .init(interface: "utun4", addresses: ["10.20.0.0/16"]),
+            .init(direct: true, addresses: ["203.0.113.2"]),
+            // Its VPN is down and it blocks meanwhile: no pass rule at all.
+            .init(addresses: ["198.51.100.7"]),
+        ],
+        tunnels: ["utun4"]
     ))
-    #expect(policy.contains("pass out quick on utun4 to { <corp4>, <corp6> }"))
-    #expect(policy.contains("block drop out quick to { <corp4>, <corp6> }"))
-    #expect(!policy.contains("pass out quick on utun5 all"))
+    #expect(policy.contains("pass out quick on utun4 to { <lane0v4>, <lane0v6> }"))
+    #expect(policy.contains("block drop out quick to { <lane0v4>, <lane0v6> }"))
+    #expect(policy.contains("pass out quick on en0 to { <lane1v4>, <lane1v6> }"))
+    #expect(!policy.contains("to { <lane2v4>, <lane2v6> } no state"))
+    #expect(policy.contains("block drop out quick to { <lane2v4>, <lane2v6> }"))
+    // Only after every route's own rules: a tunnel up passes what reaches it.
+    #expect(policy.range(of: "pass out quick on utun4 all")!.lowerBound > policy.range(of: "block drop out quick to { <lane2v4>")!.lowerBound)
     #expect(!policy.contains("pass out quick on en0 all"))
     #expect(policy.hasSuffix("block drop out quick all\n"))
-    // OpenVPN alone: corporate stays fail-closed, the rest goes out directly.
-    let openVPNOnly = try FirewallPolicyRenderer.render(.init(physicalInterface: "en0", openVPNInterface: "utun4", directByDefault: true))
-    #expect(openVPNOnly.contains("block drop out quick to { <corp4>, <corp6> }"))
-    #expect(openVPNOnly.hasSuffix("pass out quick on en0 all no state\nblock drop out quick all\n"))
+    // Xcode reaches an iPhone over link-local and ULA on interfaces of its own;
+    // ULA passes only after the lanes, which may claim such networks.
+    #expect(policy.contains("pass out quick to { 169.254.0.0/16, 224.0.0.0/4, fe80::/10, ff00::/8 } no state"))
+    #expect(policy.range(of: "pass out quick to fc00::/7")!.lowerBound > policy.range(of: "block drop out quick to { <lane2v4>")!.lowerBound)
+    let restDirect = try FirewallPolicyRenderer.render(.init(physicalInterface: "en0", lanes: [.init(interface: "utun4")], tunnels: ["utun4"], directByDefault: true))
+    #expect(restDirect.hasSuffix("pass out quick on en0 all no state\nblock drop out quick all\n"))
 }
 
 @Test func macOSAcceptsGeneratedPFSyntax() throws {
     let policy = try FirewallPolicyRenderer.render(.init(
         physicalInterface: "en0",
-        openVPNInterface: "utun4",
-        amneziaWGInterface: "utun5",
-        corporate: ["10.20.0.0/16", "2001:db8::/32"],
-        direct: ["203.0.113.2", "2001:db8:1::/48"],
         control: ["1.1.1.1"],
         lan: ["192.168.1.0/24", "fe80::/10"],
+        lanes: [
+            .init(interface: "utun4", addresses: ["10.20.0.0/16", "2001:db8::/32"]),
+            .init(direct: true, addresses: ["203.0.113.2", "2001:db8:1::/48"]),
+            .init(interface: "utun101", direct: false, addresses: []),
+        ],
+        tunnels: ["utun4", "utun5", "utun101"],
         directByDefault: true
     ))
     let url = FileManager.default.temporaryDirectory.appendingPathComponent("commutator-\(UUID().uuidString).pf")
@@ -356,7 +435,7 @@ private func makeAmneziaShareLink(container: String = "amnezia-awg", protoKey: S
     #expect(throws: RouterErrorInfo.self) {
         try FirewallPolicyRenderer.render(.init(
             physicalInterface: "en0",
-            corporate: ["10.0.0.0/8 } pass out all"]
+            lanes: [.init(addresses: ["10.0.0.0/8 } pass out all"])]
         ))
     }
 }
@@ -374,18 +453,20 @@ private func makeAmneziaShareLink(container: String = "amnezia-awg", protoKey: S
     #expect(recorder.joined.last?.contains(" delete ") == true)
 }
 
-@Test func protectionStateRequiresBothHealthyInterfaces() {
+@Test func protectionStateRequiresEveryTunnelHealthy() {
     let connecting = TunnelStatus(phase: .connecting)
     let open = TunnelStatus(phase: .connected, interfaceName: "utun4")
     let awg = TunnelStatus(phase: .connected, interfaceName: "utun5")
-    #expect(ProtectionState.evaluate(desiredEnabled: false, openVPN: open, amneziaWG: awg) == .off)
-    #expect(ProtectionState.evaluate(desiredEnabled: true, openVPN: connecting, amneziaWG: connecting) == .starting)
-    #expect(ProtectionState.evaluate(desiredEnabled: true, openVPN: open, amneziaWG: connecting) == .starting)
-    #expect(ProtectionState.evaluate(desiredEnabled: true, openVPN: open, amneziaWG: nil) == .protected)
-    #expect(ProtectionState.evaluate(desiredEnabled: true, openVPN: nil, amneziaWG: .init(phase: .error)) == .degraded)
-    #expect(ProtectionState.evaluate(desiredEnabled: true, openVPN: open, amneziaWG: awg) == .protected)
-    #expect(ProtectionState.evaluate(desiredEnabled: true, openVPN: open, amneziaWG: .init(phase: .error)) == .degraded)
-    #expect(ProtectionState.evaluate(desiredEnabled: true, openVPN: .init(phase: .connected), amneziaWG: awg) == .degraded)
+    #expect(ProtectionState.evaluate(desiredEnabled: false, tunnels: [open, awg]) == .off)
+    #expect(ProtectionState.evaluate(desiredEnabled: true, tunnels: [connecting, connecting]) == .starting)
+    #expect(ProtectionState.evaluate(desiredEnabled: true, tunnels: [open, connecting]) == .starting)
+    #expect(ProtectionState.evaluate(desiredEnabled: true, tunnels: [open]) == .protected)
+    #expect(ProtectionState.evaluate(desiredEnabled: true, tunnels: [.init(phase: .error)]) == .degraded)
+    #expect(ProtectionState.evaluate(desiredEnabled: true, tunnels: [open, awg, awg]) == .protected)
+    #expect(ProtectionState.evaluate(desiredEnabled: true, tunnels: [open, awg, .init(phase: .error)]) == .degraded)
+    #expect(ProtectionState.evaluate(desiredEnabled: true, tunnels: [.init(phase: .connected), awg]) == .degraded)
+    // Only routes without a VPN: nothing can be down.
+    #expect(ProtectionState.evaluate(desiredEnabled: true, tunnels: []) == .protected)
 }
 
 @Test func routerErrorExposesItsMessage() {
@@ -402,15 +483,46 @@ private func makeAmneziaShareLink(container: String = "amnezia-awg", protoKey: S
     #expect(try IPCCodec.decoder.decode(RouterSettings.self, from: Data("{}".utf8)).watchTraffic == false)
 }
 
-@Test func killSwitchBlocksTheRestUntilAmneziaWGIsUp() throws {
-    var settings = try IPCCodec.decoder.decode(RouterSettings.self, from: Data("{}".utf8))
-    #expect(settings.killSwitch)
-    #expect(!settings.directByDefault(amneziaWGUp: false))
-    settings.killSwitch = false
-    #expect(settings.directByDefault(amneziaWGUp: false))
-    #expect(!settings.directByDefault(amneziaWGUp: true))
-    settings.useAmneziaWG = false
-    #expect(settings.directByDefault(amneziaWGUp: true))
+@Test func settingsFromBeforeRoutesBecomeWorkDirectAndPersonal() throws {
+    let old = #"""
+    {"rules":[{"id":"\#(UUID())","target":"corporate","kind":"domain","value":"corp.example","enabled":true},
+              {"id":"\#(UUID())","target":"direct","kind":"domain","value":"bank.example","enabled":true}],
+     "directRU":true,"directSU":false,"directRF":true,"useOpenVPN":false,"useAmneziaWG":true,
+     "killSwitch":false,"exitEngine":"xray","corporateDNSFallbackToCurrent":false,"launchAtLogin":true}
+    """#
+    let settings = try IPCCodec.decoder.decode(RouterSettings.self, from: Data(old.utf8))
+    #expect(settings.directions.map(\.name) == ["Работа", "Напрямую", "Личный"])
+    let (work, direct, personal) = (settings.directions[0], settings.directions[1], settings.directions[2])
+    #expect(work.path == .vpn(LegacyIDs.openVPN) && !work.enabled && work.blockWhenDown)
+    #expect(work.rules.map(\.value) == ["corp.example"] && work.rules.allSatisfy { $0.target == nil })
+    #expect(direct.path == .direct && direct.rules.map(\.value) == [".ru", ".рф", "bank.example"])
+    #expect(personal.path == .vpn(LegacyIDs.xray) && personal.enabled && !personal.blockWhenDown)
+    #expect(settings.defaultDirection == LegacyIDs.personal)
+    #expect(settings.launchAtLogin)
+    // Written back in the new form only, and read back the same.
+    let encoded = try IPCCodec.encoder.encode(settings)
+    #expect(!String(decoding: encoded, as: UTF8.self).contains("killSwitch"))
+    #expect(try IPCCodec.decoder.decode(RouterSettings.self, from: encoded) == settings)
+}
+
+@Test func stateFromBeforeRoutesKeepsEveryProfileUnderTheIdsItsRoutesUse() throws {
+    let spare = UUID()
+    let old = #"""
+    {"openVPN":{"kind":"openVPN","configuration":"client","password":"secret"},
+     "amneziaWG":{"kind":"amneziaWG","configuration":"[Interface]"},
+     "xray":{"servers":[],"selected":0,"updateInterval":43200},
+     "spares":[{"id":"\#(spare)","amneziaWG":{"kind":"amneziaWG","configuration":"[Interface] spare"}}],
+     "settings":{"preferredOpenVPNRemote":{"host":"b.example"},"exitEngine":"amneziaWG"},"enabled":true}
+    """#
+    let state = try IPCCodec.decoder.decode(StoredState.self, from: Data(old.utf8))
+    #expect(state.migrated && state.enabled)
+    // An Xray entry with no servers was nothing to run: it does not become a VPN.
+    #expect(state.connections.map(\.id) == [LegacyIDs.openVPN, LegacyIDs.amneziaWG, spare])
+    #expect(state.connections[0].openVPN?.password == "secret")
+    #expect(state.connections[0].preferredRemote == .init(host: "b.example"))
+    #expect(state.settings.directions.last?.path == .vpn(LegacyIDs.amneziaWG))
+    let saved = try IPCCodec.decoder.decode(StoredState.self, from: IPCCodec.encoder.encode(state))
+    #expect(!saved.migrated && saved.connections.count == 3)
 }
 
 private func recordingRunner(_ recorder: Recorder, fail: @escaping @Sendable (Int, [String]) -> CommandResult?) -> CommandRunner {
@@ -439,7 +551,7 @@ private func directPolicy(_ addresses: Set<String>) -> PolicyState {
         dnsServers: [],
         lanNetworks: ["192.168.1.0/24"]
     ))
-    policy.direct = addresses
+    policy.lanes = [.init(direct: true, addresses: addresses)]
     return policy
 }
 
@@ -510,33 +622,90 @@ private func directPolicy(_ addresses: Set<String>) -> PolicyState {
     #expect(DNSMessage.serverFailure(for: Data([0x12, 0x34])).isEmpty)
 }
 
-@Test func upstreamTableRoutesEachClassAndRefusesWhenUnreachable() throws {
-    let rules = try RuleSet(rules: [
-        .init(target: .direct, kind: .domain, value: "ru"),
-        .init(target: .corporate, kind: .domain, value: "corp.example"),
-    ])
+@Test func upstreamTableAsksEachRoutesResolverAndRefusesWhenUnreachable() throws {
+    let rules = try RuleSet(lists: [(direct, domains("ru")), (work, domains("corp.example"))], endpoints: ["vpn.corp.example"])
     let table = UpstreamTable()
     #expect(table.servers(for: "example.com").isEmpty) // nothing configured yet
 
     table.update(.init(
         ruleSet: rules,
-        corporate: ["10.0.0.53"],
-        direct: ["192.168.1.1", "192.168.1.2"],
-        amneziaWG: ["10.8.0.1"]
+        network: ["192.168.1.1", "192.168.1.2"],
+        lanes: [work: ["10.0.0.53"], direct: ["192.168.1.1", "192.168.1.2"]],
+        rest: ["10.8.0.1"]
     ))
     #expect(table.servers(for: "api.corp.example") == ["10.0.0.53"])
     // The whole list is handed over: the proxy falls over to the second server
-    // instead of losing the class to one dead resolver.
+    // instead of losing the route to one dead resolver.
     #expect(table.servers(for: "www.example.ru") == ["192.168.1.1", "192.168.1.2"])
+    #expect(table.servers(for: "vpn.corp.example") == ["192.168.1.1", "192.168.1.2"])
     #expect(table.servers(for: "example.com") == ["10.8.0.1"])
     #expect(table.tracksAddresses(for: "www.example.ru"))
     #expect(!table.tracksAddresses(for: "example.com"))
 
-    // AmneziaWG down: its resolver lives behind the tunnel, so we refuse rather
-    // than quietly leak the name to the network's DNS.
-    table.update(.init(ruleSet: rules, corporate: ["10.0.0.53"], direct: ["192.168.1.1"], amneziaWG: []))
+    // The rest's VPN down: its resolver lives behind the tunnel, so we refuse
+    // rather than quietly leak the name to the network's DNS.
+    table.update(.init(ruleSet: rules, network: ["192.168.1.1"], lanes: [work: []], rest: []))
     #expect(table.servers(for: "example.com").isEmpty)
-    #expect(table.servers(for: "www.example.ru") == ["192.168.1.1"])
+    #expect(table.servers(for: "api.corp.example").isEmpty)
+}
+
+@Test func aNarrowerNetworkInsideAHigherRoutesOneGoesTheHigherWay() {
+    var policy = directPolicy([])
+    policy.control = ["192.0.2.1"]
+    policy.lanes = [
+        .init(interface: "utun4", addresses: ["10.0.0.0/8"]),
+        // Lower routes: its /16 and a site address inside 10/8 must not win in
+        // the kernel by being longer, while PF drops them as the first route's.
+        .init(interface: "utun101", addresses: ["10.20.0.0/16", "10.9.9.9", "198.51.100.1", "192.0.2.1"]),
+        // Down and blocking: no route, PF drops it wherever it would go.
+        .init(addresses: ["203.0.113.5"]),
+        .init(direct: true, addresses: ["203.0.113.9"]),
+    ]
+    policy.defaultInterface = "utun5"
+    let routes = RouteController.routes(for: policy)
+    let tunnel = { (destination: String, interface: String) in routes.contains(.init(family: .v4, destination: destination, gateway: nil, interface: interface)) }
+    #expect(tunnel("10.0.0.0/8", "utun4"))
+    #expect(!routes.contains { $0.destination == "10.20.0.0/16" || $0.destination == "10.9.9.9/32" })
+    #expect(tunnel("198.51.100.1/32", "utun101"))
+    #expect(routes.filter { $0.destination == "192.0.2.1/32" }.map(\.gateway) == ["192.168.1.1"])
+    #expect(!routes.contains { $0.destination == "203.0.113.5/32" })
+    #expect(routes.contains(.init(family: .v4, destination: "203.0.113.9/32", gateway: "192.168.1.1", interface: nil)))
+    #expect(tunnel("0.0.0.0/1", "utun5") && tunnel("128.0.0.0/1", "utun5"))
+}
+
+@Test func trackedAnswersAreCachedForAMinuteAtMost() throws {
+    // example.com A 203.0.113.8, TTL 3600, then an OPT record whose TTL field
+    // holds flags and must not be touched.
+    let packet: [UInt8] = [
+        0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x07, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x03, 0x63, 0x6f, 0x6d, 0x00, 0x00, 0x01, 0x00, 0x01,
+        0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10, 0x00, 0x04, 203, 0, 113, 8,
+        0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+    ]
+    let capped = DNSMessage.cappingTTL(Data(packet), to: 60)
+    #expect(try DNSMessage.parse(capped).addresses == [.init(name: "example.com", address: "203.0.113.8", ttl: 60)])
+    #expect(Array(capped.suffix(11)) == Array(packet.suffix(11)))
+    // Shorter already: left alone. Not a DNS message: returned as it came.
+    #expect(DNSMessage.cappingTTL(capped, to: 3600) == capped)
+    #expect(DNSMessage.cappingTTL(Data([1, 2, 3]), to: 60) == Data([1, 2, 3]))
+}
+
+@Test func openConnectionsAreReadFromNetstat() {
+    let output = """
+    Active Internet connections (including servers)
+    Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)
+    tcp4       0      0  192.168.1.5.52341      104.18.32.47.443       ESTABLISHED
+    tcp6       0      0  2a02:6b8::1.52342      2a00:1450:4010:c0e::64.443 ESTABLISHED
+    tcp4       0      0  *.53                   *.*                    LISTEN
+    udp4       0      0  192.168.1.5.5353       224.0.0.251.5353
+    """
+    #expect(OpenConnections.remoteAddresses(output) == ["104.18.32.47", "2a00:1450:4010:c0e::64", "224.0.0.251"])
+}
+
+@Test func twoXrayTunnelsGetAddressesOfTheirOwn() {
+    #expect(XrayProfileParser.gateway(slot: 0) == "198.18.0.1/30")
+    #expect(XrayProfileParser.gateway(slot: 1) == "198.18.0.5/30")
+    #expect(XrayProfileParser.gateway(slot: 64) == "198.18.1.1/30")
 }
 
 @Test func amneziaKeepsMTUAndRejectsAnImpossibleOne() throws {
@@ -772,8 +941,8 @@ private func directPolicy(_ addresses: Set<String>) -> PolicyState {
 }
 
 @Test func routesCoveringTheDefaultAreRefused() {
-    #expect(throws: RouterErrorInfo.self) { try RuleSet(rules: [.init(target: .direct, kind: .cidr, value: "0.0.0.0/0")]) }
-    #expect(throws: RouterErrorInfo.self) { try RuleSet(rules: [.init(target: .corporate, kind: .cidr, value: "::/1")]) }
+    #expect(throws: RouterErrorInfo.self) { try RuleSet(lists: [(direct, networks("0.0.0.0/0"))]) }
+    #expect(throws: RouterErrorInfo.self) { try RuleSet(lists: [(work, networks("::/1"))]) }
     let pushed = OpenVPNProfileParser.pushedOptions(from: "PUSH_REPLY,route 0.0.0.0 128.0.0.0,route 128.0.0.0 128.0.0.0,route 10.0.0.0 255.0.0.0")
     #expect(pushed.routes == ["10.0.0.0/8"])
 }
@@ -916,13 +1085,10 @@ private func dig(_ value: Any?, _ path: String...) -> Any? {
 }
 
 @Test func vpnServerNameStaysDirectUnderItsPushedCorporateDomain() throws {
-    let rules = try RuleSet(
-        rules: [.init(target: .corporate, kind: .domain, value: "corp.example")],
-        endpoints: ["vpn.corp.example"]
-    )
-    #expect(rules.classify(domain: "VPN.corp.example.") == .direct)
-    #expect(rules.classify(domain: "mail.corp.example") == .corporate)
-    #expect(rules.classify(domain: "a.vpn.corp.example") == .corporate)
+    let rules = try RuleSet(lists: [(work, domains("corp.example"))], endpoints: ["vpn.corp.example"])
+    #expect(rules.classify(domain: "VPN.corp.example.") == .endpoint)
+    #expect(rules.classify(domain: "mail.corp.example") == .direction(work))
+    #expect(rules.classify(domain: "a.vpn.corp.example") == .direction(work))
     #expect(rules.domainSuffixes.contains("vpn.corp.example"))
 }
 
@@ -1020,4 +1186,100 @@ private func dig(_ value: Any?, _ path: String...) -> Any? {
     #expect(AppRelease.parse(latest("v1.0.6"), installed: "1.0.6") == nil)
     #expect(AppRelease.parse(latest("v1.0.7", asset: "Other.zip"), installed: "1.0.6") == nil)
     #expect(AppRelease.parse(Data("{}".utf8), installed: "1.0.6") == nil)
+}
+
+@Test func aFreshInstallHasWorkPersonalAndDirectAndNothingBlocksTurningOn() {
+    let fresh = RouterSettings()
+    #expect(fresh.directions.map(\.id) == [LegacyIDs.work, LegacyIDs.personal, LegacyIDs.direct])
+    #expect(fresh.directions.map(\.name) == ["Работа", "Личный", "Напрямую"])
+    #expect(fresh.defaultDirection == LegacyIDs.personal)
+    // Both wait, off, for a VPN: a route that is on yet cannot run would block «Включить».
+    #expect(fresh.directions[0].path == .unset && !fresh.directions[0].enabled)
+    #expect(fresh.directions[1].path == .unset && !fresh.directions[1].enabled)
+    #expect(fresh.activeDirections.map(\.id) == [LegacyIDs.direct])
+    #expect(fresh.directions[2].rules.map(\.value) == [".ru", ".su", ".рф"])
+}
+
+private func withVPNs() -> RouterSettings {
+    var settings = RouterSettings()
+    for index in [0, 1] {
+        settings.directions[index].path = .vpn(UUID())
+        settings.directions[index].enabled = true
+    }
+    return settings
+}
+
+@Test func aWorkSiteWinsOverTheDirectListWhereverTheRestGoes() throws {
+    let settings = withVPNs()
+    for rest in [LegacyIDs.personal, LegacyIDs.direct] {
+        var draft = RoutingDraft(settings: settings)
+        draft.defaultDirection = rest
+        draft.texts[LegacyIDs.work] = "company.ru"
+        draft.texts[LegacyIDs.direct] = ".ru"
+        draft.texts[LegacyIDs.personal] = ".ru"
+        let applied = try draft.applied(to: settings)
+        let rules = try RuleSet(lists: applied.activeDirections.map { ($0.id, $0.rules) })
+        #expect(rules.classify(domain: "company.ru") == .direction(LegacyIDs.work))
+    }
+}
+
+@Test func theRestsListIsNotAppliedAndNotCounted() throws {
+    let settings = withVPNs()
+    var draft = RoutingDraft(settings: settings)
+    // 500 rules in all, the rest's list aside: it is not applied, so it does not count.
+    draft.texts[LegacyIDs.work] = (1...500).map { "w\($0).example" }.joined(separator: "\n")
+    draft.texts[LegacyIDs.personal] = "hidden.example"
+    draft.texts[LegacyIDs.direct] = ""
+    #expect(throws: Never.self) { _ = try draft.applied(to: settings) }
+    #expect(try draft.applied(to: settings).directions[1].rules.isEmpty)
+    draft.texts[LegacyIDs.direct] = ".ru"
+    #expect(throws: RouterErrorInfo.self) { _ = try draft.applied(to: settings) }
+}
+
+@Test func aRouteThatIsOffGivesItsSitesToTheRest() throws {
+    var settings = withVPNs()
+    settings.directions[0].enabled = false
+    settings.directions[0].rules = domains("corp.example")
+    let rules = try RuleSet(lists: settings.activeDirections.map { ($0.id, $0.rules) })
+    #expect(rules.classify(domain: "corp.example") == nil)
+    #expect(settings.activeDefault?.id == LegacyIDs.personal)
+}
+
+@Test func theDraftTakesTheKeptListOfTheRestsRouteAndOnlyThat() {
+    let settings = withVPNs()
+    let personal = LegacyIDs.personal
+    let draft = RoutingDraft(settings: settings, parked: [personal: "youtube.com", LegacyIDs.direct: "stale.example"])
+    // «Личный» takes the rest, so its kept list is the one not applied.
+    #expect(draft.texts[personal] == "youtube.com")
+    #expect(draft.texts[LegacyIDs.direct] == RoutingDraft(settings: settings).texts[LegacyIDs.direct])
+    // Nothing kept: that list is empty, and a draft with nothing kept equals a plain one.
+    #expect(RoutingDraft(settings: settings, parked: [:]).texts[personal] == "")
+    #expect(RoutingDraft(settings: settings, parked: [:]) == RoutingDraft(settings: settings))
+}
+
+@Test func settingsFromBeforeRoutesKeepTheirZonesAndSwitches() throws {
+    let old = Data(#"{"useOpenVPN": false, "directRU": true, "directSU": false, "directRF": false, "killSwitch": false, "rules": []}"#.utf8)
+    let migrated = try JSONDecoder().decode(RouterSettings.self, from: old)
+    #expect(migrated.directions.map(\.id) == [LegacyIDs.work, LegacyIDs.direct, LegacyIDs.personal])
+    #expect(!migrated.directions[0].enabled)
+    #expect(migrated.directions[1].rules.map(\.value) == [".ru"])
+    #expect(migrated.defaultDirection == LegacyIDs.personal)
+    #expect(!migrated.directions[2].blockWhenDown)
+}
+
+@Test func settingsFrom107CarryOverWithTheVPNsThatWereThereOneOrTwo() throws {
+    let old = try JSONDecoder().decode(RouterSettings.self, from: Data(#"{"useOpenVPN": true, "useAmneziaWG": true, "rules": []}"#.utf8))
+
+    // Only the personal profile was saved: work waits, off, and does not block «Включить».
+    let personalOnly = old.droppingMissing(live: [LegacyIDs.amneziaWG])
+    #expect(personalOnly.directions[0].path == .unset && !personalOnly.directions[0].enabled)
+    #expect(personalOnly.directions[2].path == .vpn(LegacyIDs.amneziaWG) && personalOnly.directions[2].enabled)
+
+    // Only the work profile: the rest has no VPN to go through, so it goes straight out.
+    let workOnly = old.droppingMissing(live: [LegacyIDs.openVPN])
+    #expect(workOnly.directions[0].enabled && !workOnly.directions[2].enabled)
+    #expect(workOnly.activeDefault == nil)
+
+    // Both: nothing changes.
+    #expect(old.droppingMissing(live: [LegacyIDs.openVPN, LegacyIDs.amneziaWG]) == old)
 }

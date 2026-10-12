@@ -130,22 +130,26 @@ struct NetworkSnapshot: Codable, Equatable, Sendable {
     }
 }
 
+/// One route as the kernel and PF see it: its addresses and where they go.
+struct PolicyLane: Equatable, Sendable {
+    /// Its tunnel, while that is up.
+    var interface: String?
+    /// Out through the network: no VPN, or a VPN that is down and not to block.
+    var direct = false
+    var addresses: Set<String> = []
+}
+
 struct PolicyState: Equatable, Sendable {
     var snapshot: NetworkSnapshot
-    var openVPNInterface: String?
-    var amneziaWGInterface: String?
-    var amneziaWGSupportsIPv6 = false
+    /// The routes that are on, in priority order.
+    var lanes: [PolicyLane] = []
+    /// The tunnel carrying what no route claims, while it is up.
+    var defaultInterface: String?
+    var defaultSupportsIPv6 = false
     var directByDefault = false
-    var corporate: Set<String> = []
-    var direct: Set<String> = []
+    /// Every tunnel that is up.
+    var tunnels: [String] = []
     var control: Set<String> = []
-
-    var corporate4: [String] { corporate.filter { !$0.contains(":") }.sorted() }
-    var corporate6: [String] { corporate.filter { $0.contains(":") }.sorted() }
-    var direct4: [String] { direct.filter { !$0.contains(":") }.sorted() }
-    var direct6: [String] { direct.filter { $0.contains(":") }.sorted() }
-    var control4: [String] { control.filter { !$0.contains(":") }.sorted() }
-    var control6: [String] { control.filter { $0.contains(":") }.sorted() }
 }
 
 final class PFController {
@@ -166,12 +170,10 @@ final class PFController {
         }
         let configuration = try FirewallPolicyRenderer.render(.init(
             physicalInterface: state.snapshot.physicalInterface,
-            openVPNInterface: state.openVPNInterface,
-            amneziaWGInterface: state.amneziaWGInterface,
-            corporate: Array(state.corporate),
-            direct: Array(state.direct),
             control: Array(state.control),
             lan: state.snapshot.lanNetworks,
+            lanes: state.lanes.map { .init(interface: $0.interface, direct: $0.direct, addresses: Array($0.addresses)) },
+            tunnels: state.tunnels,
             directByDefault: state.directByDefault
         ))
         let path = "/var/run/vpn-router-pf.conf"
@@ -199,21 +201,7 @@ final class RouteController {
     init(runner: CommandRunner) { self.runner = runner }
 
     func reconcile(_ state: PolicyState) throws {
-        var desired = Set<Route>()
-        for address in state.control.union(state.direct) {
-            if let route = Route.physical(address, snapshot: state.snapshot) { desired.insert(route) }
-        }
-        if let interface = state.openVPNInterface {
-            desired.formUnion(state.corporate.compactMap { Route.tunnel($0, interface: interface) })
-        }
-        if let interface = state.amneziaWGInterface {
-            desired.insert(.init(family: .v4, destination: "0.0.0.0/1", gateway: nil, interface: interface))
-            desired.insert(.init(family: .v4, destination: "128.0.0.0/1", gateway: nil, interface: interface))
-            if state.amneziaWGSupportsIPv6 {
-                desired.insert(.init(family: .v6, destination: "::/1", gateway: nil, interface: interface))
-                desired.insert(.init(family: .v6, destination: "8000::/1", gateway: nil, interface: interface))
-            }
-        }
+        let desired = Self.routes(for: state)
         let original = installed
         var added: [Route] = []
         do {
@@ -230,6 +218,46 @@ final class RouteController {
             installed = original
             throw error
         }
+    }
+
+    /// Each destination goes the way the highest route claiming it says, as PF
+    /// lets it: a lower route's network inside a higher one's would otherwise
+    /// win in the kernel by being longer, and PF would drop what it sent.
+    // ponytail: every destination is checked against every one before it; an
+    // interval tree if thousands of live addresses ever make this slow.
+    static func routes(for state: PolicyState) -> Set<Route> {
+        var desired = Set<Route>()
+        var claimed: [CIDR] = []
+        func network(_ value: String) -> CIDR? {
+            CIDR(value) ?? IPAddress(value).map { CIDR(address: $0, prefixLength: $0.family == .v4 ? 32 : 128) }
+        }
+        for address in state.control.sorted() {
+            if let route = Route.physical(address, snapshot: state.snapshot) { desired.insert(route) }
+            if let cidr = network(address) { claimed.append(cidr) }
+        }
+        for lane in state.lanes {
+            for address in lane.addresses.sorted() {
+                guard let cidr = network(address),
+                      !claimed.contains(where: { $0.prefixLength <= cidr.prefixLength && $0.contains(cidr.address) })
+                else { continue }
+                claimed.append(cidr)
+                // A lane down and blocking gets no route: PF drops it wherever it goes.
+                if let interface = lane.interface {
+                    if let route = Route.tunnel(address, interface: interface) { desired.insert(route) }
+                } else if lane.direct, let route = Route.physical(address, snapshot: state.snapshot) {
+                    desired.insert(route)
+                }
+            }
+        }
+        if let interface = state.defaultInterface {
+            desired.insert(.init(family: .v4, destination: "0.0.0.0/1", gateway: nil, interface: interface))
+            desired.insert(.init(family: .v4, destination: "128.0.0.0/1", gateway: nil, interface: interface))
+            if state.defaultSupportsIPv6 {
+                desired.insert(.init(family: .v6, destination: "::/1", gateway: nil, interface: interface))
+                desired.insert(.init(family: .v6, destination: "8000::/1", gateway: nil, interface: interface))
+            }
+        }
+        return desired
     }
 
     func cleanup() {
@@ -257,7 +285,7 @@ final class RouteController {
     }
 }
 
-private struct Route: Hashable {
+struct Route: Hashable {
     let family: IPFamily
     let destination: String
     let gateway: String?

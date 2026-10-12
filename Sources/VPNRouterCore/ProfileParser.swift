@@ -247,6 +247,9 @@ public struct AmneziaWGProfile: Sendable {
     public let endpoint: String
     public let supportsIPv6: Bool
     public let mtu: Int?
+    /// WireGuard when the profile uses only native keys; AmneziaWG when at
+    /// least one non-empty protocol extension is present.
+    public let protocolTitle: String
 
     /// The endpoint without its port: what a resolver, a route and a pass rule take.
     public var endpointHost: String {
@@ -271,6 +274,9 @@ public enum AmneziaWGProfileParser {
         var currentPeerHasDefault = false
         var currentPeerHasKeepalive = false
         var supportsIPv6 = false
+        var usesAmneziaExtensions = false
+        let wireGuardInterfaceKeys: Set<String> = ["privatekey", "listenport", "fwmark"]
+        let wireGuardPeerKeys: Set<String> = ["publickey", "presharedkey", "allowedips", "endpoint", "persistentkeepalive"]
 
         func finishPeer() {
             guard !currentPeer.isEmpty else { return }
@@ -312,15 +318,22 @@ public enum AmneziaWGProfileParser {
                         throw RouterErrorInfo(.invalidConfiguration, "Некорректный MTU в AWG-профиле")
                     }
                     mtu = value
-                case "table": break
+                // wg-quick's own keys, not WireGuard's: awg setconf rejects them.
+                case "table", "saveconfig": break
                 case "preup", "postup", "predown", "postdown":
                     throw RouterErrorInfo(.invalidConfiguration, "Скрипты в AWG-профиле не поддерживаются")
                 // I1..I5 are routinely left blank; an empty knob sets nothing and
                 // awg setconf rejects a bare "I2 =".
-                default: if !value.isEmpty { interfaceLines.append("\(rawKey) = \(value)") }
+                default: if !value.isEmpty {
+                    interfaceLines.append("\(rawKey) = \(value)")
+                    usesAmneziaExtensions = usesAmneziaExtensions || !wireGuardInterfaceKeys.contains(key)
+                }
                 }
             } else if section == "peer" {
-                if !value.isEmpty { currentPeer.append("\(rawKey) = \(value)") }
+                if !value.isEmpty {
+                    currentPeer.append("\(rawKey) = \(value)")
+                    usesAmneziaExtensions = usesAmneziaExtensions || !wireGuardPeerKeys.contains(key)
+                }
                 if key == "endpoint" { endpoint = value }
                 if key == "persistentkeepalive" { currentPeerHasKeepalive = true }
                 if key == "allowedips" {
@@ -362,7 +375,8 @@ public enum AmneziaWGProfileParser {
             dnsServers: dns,
             endpoint: endpoint,
             supportsIPv6: supportsIPv6,
-            mtu: mtu
+            mtu: mtu,
+            protocolTitle: usesAmneziaExtensions ? "AmneziaWG" : "WireGuard"
         )
     }
 

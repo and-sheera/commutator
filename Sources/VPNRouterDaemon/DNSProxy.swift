@@ -8,9 +8,12 @@ import VPNRouterCore
 final class UpstreamTable: @unchecked Sendable {
     struct Plan: Sendable {
         var ruleSet: RuleSet
-        var corporate: [String]
-        var direct: [String]
-        var amneziaWG: [String]
+        /// The network's own resolvers, for the VPN servers' names.
+        var network: [String]
+        /// Each route's resolvers, by route id.
+        var lanes: [UUID: [String]]
+        /// For whatever no route claims.
+        var rest: [String]
     }
 
     private let lock = NSLock()
@@ -29,11 +32,11 @@ final class UpstreamTable: @unchecked Sendable {
         let plan = self.plan
         lock.unlock()
         guard let plan else { return false }
-        return plan.ruleSet.classify(domain: domain) != .amneziaWG
+        return plan.ruleSet.classify(domain: domain) != nil
     }
 
-    /// An empty list means "refuse": either we are not running yet, or the class
-    /// has no reachable resolver. Never silently falls back to another class's
+    /// An empty list means "refuse": either we are not running yet, or the route
+    /// has no reachable resolver. Never silently falls back to another route's
     /// server. More than one entry is a failover list, tried in order.
     func servers(for domain: String) -> [String] {
         lock.lock()
@@ -41,9 +44,9 @@ final class UpstreamTable: @unchecked Sendable {
         lock.unlock()
         guard let plan else { return [] }
         switch plan.ruleSet.classify(domain: domain) {
-        case .corporate: return plan.corporate
-        case .direct: return plan.direct
-        case .amneziaWG: return plan.amneziaWG
+        case .endpoint?: return plan.network
+        case .direction(let id)?: return plan.lanes[id] ?? []
+        case nil: return plan.rest
         }
     }
 }
@@ -57,6 +60,9 @@ final class DNSProxy: @unchecked Sendable {
     // Two servers per class at two seconds each keeps the worst case under the
     // five seconds a client typically waits before giving up on us.
     private static let perServerTimeout: TimeInterval = 2
+    /// Answers for names a route claims are cached no longer than the daemon
+    /// keeps their route without an open connection.
+    static let trackedTTL: UInt32 = 60
 
     private let queue = DispatchQueue(label: "com.vpnrouter.dns")
     private let upstreams: UpstreamTable
@@ -180,9 +186,12 @@ final class DNSProxy: @unchecked Sendable {
                         }
                         // The route and the PF pass must exist before the client
                         // learns the address, so this answer waits on the actor.
+                        // It is kept no longer than the route is: see bindingLifetime.
+                        let answer = DNSMessage.cappingTTL(response, to: Self.trackedTTL)
                         Task {
                             await self.didReceiveResponse(response, name)
-                            deliver()
+                            client.send(content: answer, completion: .contentProcessed { _ in })
+                            connection.cancel()
                         }
                     }
                 })
@@ -263,9 +272,13 @@ final class DNSProxy: @unchecked Sendable {
                             Task { await self.didReceiveResponse(response, name) }
                             return deliver()
                         }
+                        let answer = DNSMessage.cappingTTL(response, to: Self.trackedTTL)
                         Task {
                             await self.didReceiveResponse(response, name)
-                            deliver()
+                            client.send(content: Self.framed(answer), completion: .contentProcessed { _ in
+                                upstream.cancel()
+                                client.cancel()
+                            })
                         }
                     }
                 }
